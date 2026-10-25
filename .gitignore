@@ -27,6 +27,7 @@ skills-code.txt
 
 #project
 cookie.txt
+data/
 pdd_goods.jsonl
 pdd_manifest.json
 _search.js

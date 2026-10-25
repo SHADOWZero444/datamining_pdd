@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import sys
 import time
@@ -6,12 +7,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, urljoin
 
+# 打包成 exe 后，程序会去自己的目录找浏览器。这里改成用本机已经装好的浏览器。
+_local_browsers = Path(os.environ.get("LOCALAPPDATA", "")) / "ms-playwright"
+if _local_browsers.exists():
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(_local_browsers)
+
 from playwright.sync_api import sync_playwright
 
 # 改这个词，就会搜这个词。
-SEARCH_VALUE = "蓝牙耳机"
-# 每次向下滚一屏大约再加载 20 条。页面有 1 万多件，一次全抓会把登录态用废。
-MAX_PAGES = 5
+SEARCH_VALUE = ""
+# 页面上的“1万+”不是接口真正返回的数量。翻页接口有自己的 total，到了就停。
+# 这是防止页面卡住时无限滚动的保险上限。
+SAFETY_LIMIT = 500
 BASE = "https://mobile.pinduoduo.com/"
 COOKIE_FILE = Path("cookie.txt")
 OUTPUT_FILE = Path("pdd_goods.jsonl")
@@ -57,6 +64,80 @@ def read_js_string(block, key):
     return json.loads(match.group(1))
 
 
+# 标签看图片地址里的固定片段，不看整张图是否相同。
+BADGE_MARKS = {
+    "bybt": "bybt",
+    "black": "brand_black_label",
+    "official": "6e9dba7f-bef0-4263-a355-e42dc63485c7",
+    "flagship": "962149d1-b03a-47fb-be05-7f289e14ed3b",
+}
+
+
+def badges_from_urls(urls):
+    """根据角标图片地址判断商品带了哪些标签。"""
+    text = " ".join(urls).lower()
+    return [key for key, mark in BADGE_MARKS.items() if mark.lower() in text]
+
+
+def urls_in_block(block):
+    raw = re.findall(r'url:\s*"((?:\\.|[^"\\])*)"', block)
+    urls = []
+    for item in raw:
+        try:
+            urls.append(json.loads(f'"{item}"'))
+        except json.JSONDecodeError:
+            urls.append(item)
+    return urls
+
+
+def urls_in_model(model):
+    urls = []
+
+    def walk(node):
+        if isinstance(node, str) and "http" in node:
+            urls.append(node)
+        elif isinstance(node, dict):
+            for key, value in node.items():
+                if key in ("url", "img_url", "image_url") or "icon" in key.lower():
+                    walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    for key in ("icon_list", "prefix_icons", "prefixIcons"):
+        walk(model.get(key))
+    return urls
+
+
+def parse_price(value):
+    match = re.search(r"\d+(?:\.\d+)?", str(value or ""))
+    return float(match.group(0)) if match else None
+
+
+def apply_filters(goods, filters):
+    """按标签、价格区间、禁用词留下符合条件的商品。"""
+    filters = filters or {}
+    wanted = set(filters.get("tags") or [])
+    banned = [word.strip() for word in str(filters.get("banned") or "").split(",") if word.strip()]
+    low = filters.get("price_min")
+    high = filters.get("price_max")
+    kept = []
+    for item in goods:
+        marks = set(item.get("badges") or [])
+        if wanted and not wanted.issubset(marks):
+            continue
+        price = parse_price(item.get("price"))
+        if low is not None and (price is None or price < low):
+            continue
+        if high is not None and (price is None or price > high):
+            continue
+        title = (item.get("title") or "").casefold()
+        if any(word.casefold() in title for word in banned):
+            continue
+        kept.append(item)
+    return kept
+
+
 def parse_goods(html):
     """解析你保存的 pdd.html。线上页面改由浏览器直接读 rawData。"""
     goods = []
@@ -75,6 +156,7 @@ def parse_goods(html):
         link = read_js_string(block, "linkURL")
         mall = re.search(r"mall_id:\s*(\d+)", block)
         tags = [json.loads(f'"{text}"') for text in re.findall(r'text:\s*"((?:\\.|[^"\\])*)"', head)]
+        icon_block = re.search(r"prefixIcons:\s*\[(.*?)\]", block, re.S)
         seen.add(goods_id)
         goods.append({
             "goods_id": goods_id,
@@ -84,6 +166,7 @@ def parse_goods(html):
             "image": read_js_string(head, "imgUrl"),
             "mall_id": mall.group(1) if mall else "",
             "tags": tags,
+            "badges": badges_from_urls(urls_in_block(icon_block.group(1) if icon_block else "")),
             "url": urljoin(BASE, link) if link else f"{BASE}goods.html?goods_id={goods_id}",
             "keyword": SEARCH_VALUE,
         })
@@ -110,6 +193,7 @@ def read_live_goods(page):
                 image: item.imgUrl || "",
                 mall_id: item.mallEntrance && item.mallEntrance.mall_id ? String(item.mallEntrance.mall_id) : "",
                 tags: (item.tagList || []).map((tag) => tag.text).filter(Boolean),
+                icons: (item.prefixIcons || []).map((icon) => icon && icon.url).filter(Boolean),
                 url: item.linkURL || "",
             }));
         }"""
@@ -122,6 +206,61 @@ def read_live_goods(page):
         elif not link:
             row["url"] = f"{BASE}goods.html?goods_id={row['goods_id']}"
         row["keyword"] = SEARCH_VALUE
+        row["badges"] = badges_from_urls(row.pop("icons", []) or [])
+        goods.append(row)
+    return goods
+
+
+def read_dom_goods(page):
+    """接口现在是加密的。商品画在页面上，就从卡片里把编号、名字和价格读出来。"""
+    rows = page.evaluate(
+        """() => {
+            function readCard(node) {
+                const fiberKey = Object.keys(node).find((key) => key.startsWith("__reactFiber"));
+                let fiber = fiberKey ? node[fiberKey] : null;
+                for (let i = 0; i < 18 && fiber; i += 1) {
+                    const props = fiber.memoizedProps || {};
+                    const data = props.data || props.item || props.goods || props.goodsData;
+                    if (data && (data.goodsID || data.goods_id)) {
+                        return {
+                            goods_id: String(data.goodsID || data.goods_id),
+                            title: data.goodsName || data.goods_name || "",
+                            price: data.priceInfo || data.price_info || "",
+                            sales: data.salesTip || data.sales_tip || "",
+                            image: data.imgUrl || data.thumb_url || data.hd_thumb_url || "",
+                            link: data.linkURL || data.link_url || "",
+                            mall_id: String((data.mallEntrance && data.mallEntrance.mall_id) || data.mall_id || ""),
+                            icons: (data.prefixIcons || []).map((icon) => icon && icon.url).filter(Boolean),
+                        };
+                    }
+                    fiber = fiber.return;
+                }
+                return null;
+            }
+            const cards = [...document.querySelectorAll("div")].filter((node) => {
+                const text = node.innerText || "";
+                return text.includes("¥") && (text.includes("已拼") || text.includes("已抢")) && text.length < 280 && node.querySelector("img");
+            });
+            const rows = [];
+            const seen = new Set();
+            cards.forEach((card) => {
+                const row = readCard(card);
+                if (row && row.goods_id && !seen.has(row.goods_id)) {
+                    seen.add(row.goods_id);
+                    rows.push(row);
+                }
+            });
+            return rows;
+        }"""
+    )
+    goods = []
+    for row in rows:
+        link = row.get("link") or ""
+        row["url"] = urljoin(BASE, link) if link else f"{BASE}goods.html?goods_id={row['goods_id']}"
+        row.pop("link", None)
+        row["keyword"] = SEARCH_VALUE
+        row["tags"] = []
+        row["badges"] = badges_from_urls(row.pop("icons", []) or [])
         goods.append(row)
     return goods
 
@@ -132,50 +271,151 @@ def page_needs_login(page):
     return "login" in url or "手机登录" in text or "请登录" in text
 
 
-def collect(page):
+def is_search_api(response):
+    """翻页接口。第一页在页面里，第 21 条开始从这里来。"""
+    path = response.url.split("?", 1)[0].rstrip("/")
+    return path.endswith("/proxy/api/search")
+
+
+def normalize_model(model):
+    """把接口里的 goods_model 收成一条商品。没有 goods_id 的就丢掉。"""
+    goods_id = model.get("goods_id")
+    if not goods_id or not model.get("goods_name"):
+        return None
+    link = model.get("link_url") or ""
+    tags = [tag.get("text") for tag in (model.get("tag_list") or []) if isinstance(tag, dict) and tag.get("text")]
+    return {
+        "goods_id": str(goods_id),
+        "title": model.get("goods_name") or "",
+        "price": model.get("price_info") or "",
+        "sales": model.get("sales_tip") or "",
+        "image": model.get("thumb_url") or model.get("hd_thumb_url") or "",
+        "mall_id": str(model.get("mall_id") or ""),
+        "tags": tags,
+        "badges": badges_from_urls(urls_in_model(model)),
+        "url": urljoin(BASE, link) if link else f"{BASE}goods.html?goods_id={goods_id}",
+        "keyword": SEARCH_VALUE,
+    }
+
+
+def goods_from_api(data):
+    rows = []
+    for item in data.get("items") or []:
+        model = ((item or {}).get("item_data") or {}).get("goods_model") or {}
+        row = normalize_model(model)
+        if row:
+            rows.append(row)
+    return rows
+
+
+def collect(page, limit=None):
+    seen = {}
+    total = None
+    blocked = []
+
+    def on_response(response):
+        nonlocal total
+        if not is_search_api(response):
+            return
+        if response.status != 200:
+            blocked.append(response.status)
+            return
+        try:
+            data = response.json()
+        except Exception:
+            return
+        if data.get("total"):
+            total = int(data["total"])
+        for row in goods_from_api(data):
+            seen[row["goods_id"]] = row
+
+    page.on("response", on_response)
     page.goto(search_url(SEARCH_VALUE), wait_until="domcontentloaded", timeout=30000)
-    page.wait_for_timeout(2000)
-    if page_needs_login(page):
-        raise RuntimeError(
-            "网站跳到了登录页。cookie.txt 不是完整登录态。"
-            "请在已登录的搜索页按 F12，打开 Network，刷新，点 search_result.html，"
-            "把 Request Headers 里的整段 Cookie 覆盖写入 cookie.txt。不要把 cookie 发到聊天里。"
-        )
     try:
         page.wait_for_function(
-            "() => !!(window.rawData && window.rawData.stores)",
-            timeout=15000,
+            """() => {
+                const text = document.body ? document.body.innerText : "";
+                return !!(window.rawData && window.rawData.stores) || text.includes("已拼") || text.includes("已抢");
+            }""",
+            timeout=20000,
         )
-    except Exception as exc:
-        raise RuntimeError("页面打开了，但没有商品数据") from exc
-    seen = {}
-    for _ in range(MAX_PAGES):
-        for item in read_live_goods(page):
+    except Exception:
+        pass
+    if page_needs_login(page):
+        raise RuntimeError(
+            "网站跳到了登录页。请重新复制已登录搜索页的 Cookie 到 cookie.txt，不要发到聊天里。"
+        )
+
+    def absorb():
+        if page.evaluate("() => !!(window.rawData && window.rawData.stores)"):
+            for item in read_live_goods(page):
+                seen[item["goods_id"]] = item
+        for item in read_dom_goods(page):
             seen[item["goods_id"]] = item
-        before = len(seen)
-        page.mouse.wheel(0, 4000)
-        page.wait_for_timeout(1500)
-        for item in read_live_goods(page):
-            seen[item["goods_id"]] = item
-        if len(seen) == before:
+
+    absorb()
+    if not seen:
+        title = page.title()
+        raise RuntimeError(f"没有读到商品。当前页面是：{title}")
+    # 连续几次滚完都没有新商品，才认为到底了。滚一次没反应就停，会把后面的页丢掉。
+    stalls = 0
+    cap = limit if limit else SAFETY_LIMIT
+    while len(seen) < cap:
+        if total and len(seen) >= total:
             break
-        time.sleep(0.5)
-    return list(seen.values())
+        before = len(seen)
+        page.mouse.move(180, 520)
+        page.mouse.wheel(0, 6000)
+        page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(1600)
+        absorb()
+        if len(seen) == before:
+            stalls += 1
+            if blocked and blocked[-1] == 429:
+                print("翻页被限速，等 15 秒再继续")
+                blocked.clear()
+                time.sleep(15)
+        else:
+            stalls = 0
+            print(f"已收集 {len(seen)} 条" + (f" / {total}" if total else ""))
+        if stalls >= 4:
+            break
+        time.sleep(1.5)
+    if blocked:
+        print(f"翻页接口被拒绝 {len(blocked)} 次，状态码 {blocked[-1]}")
+    if total and len(seen) < total:
+        print(f"接口显示最多 {total} 条，这次拿到 {len(seen)} 条")
+    return list(seen.values()), total
 
 
-def write_output(goods, errors):
+def write_output(goods, errors, total):
     lines = [json.dumps(item, ensure_ascii=False) for item in goods]
     OUTPUT_FILE.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
-    status = "ok" if goods and not errors else ("partial" if goods else "failed")
+    reached = not total or len(goods) >= total
+    status = "ok" if goods and not errors and reached else ("partial" if goods else "failed")
     manifest = {
         "scrape_started_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "keyword": SEARCH_VALUE,
         "status": status,
         "records_written": len(goods),
+        "api_total": total,
         "errors": errors,
         "tool": "playwright",
     }
     MANIFEST_FILE.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def launch_browser(browser_factory):
+    """先用本机 Playwright 浏览器。找不到时再用系统自带的 Edge 或 Chrome。"""
+    try:
+        return browser_factory.chromium.launch(headless=True)
+    except Exception as first_error:
+        for channel in ("msedge", "chrome"):
+            try:
+                return browser_factory.chromium.launch(headless=True, channel=channel)
+            except Exception:
+                continue
+        raise first_error
 
 
 def main():
@@ -183,8 +423,9 @@ def main():
         sys.stdout.reconfigure(encoding="utf-8")
     errors = []
     goods = []
+    total = None
     with sync_playwright() as browser_factory:
-        browser = browser_factory.chromium.launch(headless=True)
+        browser = launch_browser(browser_factory)
         context = browser.new_context(
             user_agent=PHONE_UA,
             viewport={"width": 390, "height": 844},
@@ -193,16 +434,47 @@ def main():
         context.add_cookies(load_cookie_items())
         page = context.new_page()
         try:
-            goods = collect(page)
+            goods, total = collect(page)
         except RuntimeError as exc:
             errors.append(str(exc))
             print(exc)
         finally:
             browser.close()
-    write_output(goods, errors)
+    write_output(goods, errors, total)
     for item in goods[:10]:
         print(f"{item['title']}\t{item['price']}\t{item['sales']}")
     print(f"共 {len(goods)} 条，已写入 {OUTPUT_FILE.name}")
+
+
+def run_search(keyword, limit=None, filters=None):
+    """给界面调用。keyword 是搜索词，limit 是这次最多收多少条。"""
+    global SEARCH_VALUE
+    SEARCH_VALUE = (keyword or "").strip()
+    if not SEARCH_VALUE:
+        raise RuntimeError("搜索词不能为空")
+    errors = []
+    goods = []
+    total = None
+    with sync_playwright() as browser_factory:
+        browser = launch_browser(browser_factory)
+        context = browser.new_context(
+            user_agent=PHONE_UA,
+            viewport={"width": 390, "height": 844},
+            locale="zh-CN",
+        )
+        context.add_cookies(load_cookie_items())
+        page = context.new_page()
+        try:
+            goods, total = collect(page, limit=limit)
+        except RuntimeError as exc:
+            errors.append(str(exc))
+        finally:
+            browser.close()
+    before = len(goods)
+    goods = apply_filters(goods, filters)
+    if before and not goods:
+        errors.append("抓到了商品，但没有一条符合筛选条件")
+    return goods, total, errors
 
 
 if __name__ == "__main__":
