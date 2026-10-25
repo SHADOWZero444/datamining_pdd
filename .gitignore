@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+#ai
+AGENTS.md
+.kilo/
+skills-code.txt
+
+#project
+cookie.txt
+pdd_goods.jsonl
+pdd_manifest.json
+_search.js
+_find_api.py
+_sample.html
+_check.txt
