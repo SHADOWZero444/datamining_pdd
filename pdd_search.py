@@ -20,7 +20,26 @@ SEARCH_VALUE = ""
 # 这是防止页面卡住时无限滚动的保险上限。
 SAFETY_LIMIT = 500
 BASE = "https://mobile.pinduoduo.com/"
-COOKIE_FILE = Path("cookie.txt")
+
+
+def program_dir():
+    """软件本体所在的文件夹。打包后是 exe 旁边，开发时是项目目录。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def find_cookie_file():
+    """按顺序找登录文件：软件旁边、当前目录、项目目录。"""
+    candidates = [
+        program_dir() / "cookie.txt",
+        Path.cwd() / "cookie.txt",
+        Path(__file__).resolve().parent / "cookie.txt",
+    ]
+    for path in candidates:
+        if path.is_file() and path.stat().st_size > 0:
+            return path
+    return candidates[0]
 OUTPUT_FILE = Path("pdd_goods.jsonl")
 MANIFEST_FILE = Path("pdd_manifest.json")
 PHONE_UA = (
@@ -30,12 +49,13 @@ PHONE_UA = (
 
 
 def load_cookie_items():
-    """把 cookie.txt 拆成浏览器能用的一条条记录。这是登录通行证，不要发到网上。"""
-    if not COOKIE_FILE.exists():
-        raise RuntimeError("缺少 cookie.txt")
-    text = COOKIE_FILE.read_text(encoding="utf-8").strip()
+    """把 cookie.txt 拆成浏览器能用的一条条记录。这是登录通行证。"""
+    cookie_file = find_cookie_file()
+    if not cookie_file.is_file():
+        raise RuntimeError("还没有登录信息。请把 cookie.txt 放在软件同一文件夹里，然后重新打开软件。")
+    text = cookie_file.read_text(encoding="utf-8").strip()
     if not text:
-        raise RuntimeError("cookie.txt 是空的")
+        raise RuntimeError("登录信息是空的。请重新保存 cookie.txt 后再试。")
     items = []
     for part in text.split(";"):
         part = part.strip()
@@ -343,7 +363,7 @@ def collect(page, limit=None):
         pass
     if page_needs_login(page):
         raise RuntimeError(
-            "网站跳到了登录页。请重新复制已登录搜索页的 Cookie 到 cookie.txt，不要发到聊天里。"
+            "登录已失效。请重新登录拼多多，把新的 cookie.txt 放到软件同一文件夹里。"
         )
 
     def absorb():

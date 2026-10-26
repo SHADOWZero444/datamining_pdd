@@ -3,12 +3,18 @@ node_modules/
 
 # Build output
 dist/
-build/
+# PyInstaller 临时目录。打包脚本 build/build_exe.ps1 要保留。
+build/*
+!build/build_exe.ps1
 
 # Environment / secrets
 .env
 .env.*
 !.env.example
+
+# Python
+__pycache__/
+*.pyc
 
 # Logs
 *.log
@@ -34,3 +40,8 @@ _search.js
 _find_api.py
 _sample.html
 _check.txt
+_probe.py
+_probe_out.txt
+_live.html
+_badge.txt
+_save_check.txt

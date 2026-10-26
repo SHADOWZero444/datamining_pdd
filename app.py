@@ -1,12 +1,27 @@
 import json
 import re
+import sys
 import threading
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-ROOT = Path(__file__).resolve().parent
-WEB_ROOT = ROOT / "web"
+def program_dir():
+    """用户看到的软件目录。数据和登录文件都放在这里。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def bundle_dir():
+    """页面和图标所在目录。打包后在程序内部，开发时就是项目目录。"""
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
+    return Path(__file__).resolve().parent
+
+
+ROOT = program_dir()
+WEB_ROOT = bundle_dir() / "web"
 DATA_DIR = ROOT / "data" / "searches"
 HOST = "127.0.0.1"
 PORT = 8765
@@ -231,8 +246,9 @@ class AppHandler(SimpleHTTPRequestHandler):
 
     def serve_icon(self, path):
         relative = path.removeprefix("/icons/").replace("\\", "/")
-        file_path = (ROOT / "icons" / relative).resolve()
-        if not str(file_path).startswith(str((ROOT / "icons").resolve())) or not file_path.is_file():
+        icons_dir = (bundle_dir() / "icons").resolve()
+        file_path = (icons_dir / relative).resolve()
+        if not str(file_path).startswith(str(icons_dir)) or not file_path.is_file():
             self.send_error(404)
             return
         data = file_path.read_bytes()
@@ -256,7 +272,7 @@ def serve():
 
 def open_window():
     url = f"http://{HOST}:{PORT}"
-    icon = ROOT / "icons" / "app.ico"
+    icon = bundle_dir() / "icons" / "app.ico"
     try:
         import webview
         webview.create_window(
