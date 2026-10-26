@@ -15,11 +15,15 @@ const TAGS = [
 
 const state = {
   section: "tools",
+  toolLabel: "功能区概览",
   keywords: [],
   job: { running: false, status: "idle", message: "", keyword: "" },
-  tabs: [{ id: "search-form", title: "搜索词条爬取", kind: "form" }],
-  active: "search-form",
+  tabs: [],
+  active: null,
   keywordsOpen: true,
+  library: { groups: [], entries: [] },
+  multi: false,
+  selected: [],
   goods: {},
   form: { keyword: "", priceMin: "", priceMax: "", banned: "", tags: [] },
 };
@@ -41,6 +45,37 @@ function icon(name) {
   return `<img class="nav-ico" src="/icons/${name}" alt="">`;
 }
 
+// 词条操作用图片图标，和左侧导航同一套，放在 icons 文件夹
+const ICONS = {
+  more: icon("nav-more.png"),
+  pin: icon("nav-pin.png"),
+  close: icon("nav-close.png"),
+  rename: icon("nav-rename.png"),
+  group: icon("nav-group.png"),
+  trash: icon("nav-trash.png"),
+};
+
+function entryOf(keyword) {
+  return state.library.entries.find((item) => item.keyword === keyword);
+}
+
+function askModal({ title, text, confirmLabel, field = "" }) {
+  return new Promise((resolve) => {
+    const modal = $("modal");
+    modal.hidden = false;
+    modal.innerHTML = `<div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title">
+      <h2 id="dialog-title">${esc(title)}</h2>
+      <p class="dialog-text">${esc(text)}</p>
+      ${field ? `<div class="dialog-field"><label class="field-label" for="dialog-field">${esc(field)}</label><input id="dialog-field" type="text"></div>` : ""}
+      <div class="dialog-actions"><button class="ghost" type="button" id="dialog-cancel">取消</button><button class="start" type="button" id="dialog-ok">${esc(confirmLabel)}</button></div>
+    </div>`;
+    const finish = (value) => { modal.hidden = true; modal.innerHTML = ""; resolve(value); };
+    $("dialog-cancel").onclick = () => finish(null);
+    $("dialog-ok").onclick = () => finish(field ? $("dialog-field").value.trim() : true);
+    $("dialog-ok").focus();
+  });
+}
+
 function badgeText(id) {
   return TAGS.find((item) => item.id === id)?.label || id;
 }
@@ -60,8 +95,13 @@ function openTab(tab) {
 }
 
 function closeTab(id) {
-  state.tabs = state.tabs.filter((item) => item.id !== id);
-  if (state.active === id) state.active = state.tabs.at(-1)?.id || null;
+  const tab = state.tabs.find((item) => item.id === id);
+  state.tabs = state.tabs.filter((item) => item.id !== id && !(tab && tab.kind === "search" && item.kind === "goods" && item.keyword === tab.keyword));
+  if (tab && tab.kind === "goods" && state.active === id) {
+    state.active = `result:${tab.keyword}`;
+  } else if (!state.tabs.some((item) => item.id === state.active)) {
+    state.active = null;
+  }
   render();
 }
 
@@ -72,28 +112,65 @@ function renderNav() {
       ${icon(item.icon)}${item.label}
     </button>
   `).join("");
-  const keywords = state.keywords.map((item) => `
-    <a class="keyword-link" href="#result:${encodeURIComponent(item.keyword)}" data-keyword="${esc(item.keyword)}" ${state.active === `result:${item.keyword}` ? 'aria-current="page"' : ""}>
-      ${esc(item.keyword)}<span class="count">${item.count}</span>
-    </a>
-  `).join("");
+  const entries = [...state.library.entries].sort((a, b) => Number(b.pinned) - Number(a.pinned));
+  const renderEntry = (item) => `
+    <div class="nav-item">
+      <button class="dot" type="button" data-select="${esc(item.keyword)}" aria-pressed="${state.selected.includes(item.keyword)}" aria-label="选择${esc(item.title)}"></button>
+      <button class="sub-btn" type="button" data-keyword="${esc(item.keyword)}" title="${esc(item.title)}" ${state.active === `result:${item.keyword}` ? 'aria-current="page"' : ""}><span class="nav-label">${esc(item.title)}</span></button>
+      ${item.pinned ? `<span class="pin-mark" title="已置顶">${ICONS.pin}</span>` : ""}
+      <button class="more" type="button" data-more="${esc(item.keyword)}" aria-label="${esc(item.title)}的操作">${ICONS.more}</button>
+    </div>`;
+  const groups = state.library.groups.map((group) => `
+    <div>
+      <button class="group-toggle" type="button" data-toggle-group="${esc(group.id)}"><span class="nav-label">${group.open === false ? "展开" : "收起"} ${esc(group.name)}</span></button>
+      <div class="sub-list" ${group.open === false ? "hidden" : ""}>${entries.filter((item) => item.groupId === group.id).map(renderEntry).join("") || '<p class="help">这个分组还没有词条。</p>'}</div>
+    </div>`).join("");
+  const loose = entries.filter((item) => !item.groupId).map(renderEntry).join("");
   const tools = state.section === "tools" ? `
     <div class="sub-head">
-      <button class="sub-btn" type="button" data-open-form ${state.active === "search-form" ? 'aria-current="page"' : ""}>搜索词条爬取</button>
-      <button class="fold" type="button" data-fold-keywords aria-expanded="${state.keywordsOpen}" aria-label="展开或收起词条">${state.keywordsOpen ? "−" : "+"}</button>
+      <button class="sub-btn" type="button" data-open-form ${state.toolLabel === "搜索词条爬取" && !state.active ? 'aria-current="page"' : ""}><span class="nav-label">搜索词条爬取</span></button>
+      <button class="fold ${state.keywordsOpen ? "is-open" : ""}" type="button" data-fold-keywords aria-expanded="${state.keywordsOpen}" aria-label="${state.keywordsOpen ? "收起词条" : "展开词条"}"></button>
+      <button class="ghost nav-mini" type="button" data-new-group>分组</button>
     </div>
-    <div class="sub-list" ${state.keywordsOpen ? "" : "hidden"}>${keywords || '<p class="help">抓取完成后，词条会出现在这里。</p>'}</div>
+    <div class="sub-list" ${state.keywordsOpen ? "" : "hidden"}>
+      ${state.multi ? `<div class="multi-bar"><button class="icon-btn" type="button" data-exit-multi aria-label="退出多选">${ICONS.close}</button><button class="ghost nav-mini" type="button" data-delete-selected>删除所选</button><button class="ghost nav-mini" type="button" data-group-selected>归入分组</button></div>` : ""}
+      ${groups}${loose || '<p class="help">抓取完成后，词条会出现在这里。</p>'}
+    </div>
   ` : "";
   $("nav").innerHTML = `<div class="nav-group">${bookmarks}</div>${tools}`;
 }
 
+function activeSearch() {
+  const current = state.tabs.find((item) => item.id === state.active);
+  if (!current) return null;
+  if (current.kind === "search") return current;
+  if (current.kind === "goods") return state.tabs.find((item) => item.kind === "search" && item.keyword === current.keyword) || null;
+  return null;
+}
+
 function renderTabs() {
-  $("tabs").innerHTML = state.tabs.map((tab) => `
-    <div class="tab" role="tab" aria-selected="${tab.id === state.active}" data-tab="${esc(tab.id)}">
+  const stack = $("tab-stack");
+  if (state.section !== "tools") {
+    stack.hidden = true;
+    return;
+  }
+  stack.hidden = false;
+  const fixedSelected = !activeSearch() && !state.tabs.some((item) => item.id === state.active && item.kind === "goods");
+  const keywords = state.tabs.filter((item) => item.kind === "search").map((tab) => `
+    <div class="tab" role="tab" draggable="true" aria-selected="${Boolean(activeSearch() && activeSearch().id === tab.id)}" data-tab="${esc(tab.id)}">
       <span>${esc(tab.title)}</span>
       <button class="tab-close" type="button" data-close="${esc(tab.id)}" aria-label="关闭${esc(tab.title)}">×</button>
-    </div>
-  `).join("");
+    </div>`).join("");
+  $("tabs-main").innerHTML = `<button class="fixed-tab" type="button" data-fixed aria-selected="${fixedSelected}">${esc(state.toolLabel)}</button>${keywords}`;
+  const parent = activeSearch();
+  const details = parent ? state.tabs.filter((item) => item.kind === "goods" && item.keyword === parent.keyword) : [];
+  const detailBar = $("tabs-detail");
+  detailBar.hidden = !parent;
+  detailBar.innerHTML = details.map((tab) => `
+    <div class="tab" role="tab" draggable="true" aria-selected="${tab.id === state.active}" data-tab="${esc(tab.id)}">
+      <span>${esc(tab.title)}</span>
+      <button class="tab-close" type="button" data-close="${esc(tab.id)}" aria-label="关闭${esc(tab.title)}">×</button>
+    </div>`).join("");
 }
 
 function searchForm() {
@@ -138,25 +215,28 @@ function resultPage(keyword) {
   const running = state.job.running && state.job.keyword === keyword;
   const body = rows.length ? rows.map((item) => `
     <tr data-open-goods="${esc(item.goods_id)}" data-keyword="${esc(keyword)}">
+      <td class="seq">${esc(item.seq || "")}</td>
       <td>${item.image ? `<img class="thumb" src="${esc(item.image)}" alt="">` : '<span class="ph"></span>'}</td>
       <td>
         <p class="name">${esc(item.title || "未命名商品")}</p>
         <div class="badges">${(item.badges || []).map((id) => `<span>${esc(badgeText(id))}</span>`).join("")}</div>
       </td>
+      <td class="shop">${esc(item.shop_name || "未知")}</td>
       <td class="price">${money(item.price)}</td>
       <td class="sales">${esc(item.sales || "—")}</td>
     </tr>
-  `).join("") : `<tr><td colspan="4"><p class="empty">${running ? "正在抓取，结果会陆续出现在这里。" : "还没有符合条件的商品。"}</p></td></tr>`;
+  `).join("") : `<tr><td colspan="6"><p class="empty">${running ? "正在抓取，结果会陆续出现在这里。" : "还没有符合条件的商品。"}</p></td></tr>`;
   return `
     <div class="result-head">
       <div>
-        <h1 class="page-title">${esc(keyword)}</h1>
+        <h1 class="page-title">${esc(entryOf(keyword)?.title || keyword)}</h1>
+        <p class="lede">搜索词条：${esc(keyword)}</p>
         <p class="lede">${esc(state.job.keyword === keyword ? (state.job.message || `已保存 ${rows.length} 条`) : `已保存 ${rows.length} 条`)}</p>
         <button class="ghost" type="button" data-delete-keyword="${esc(keyword)}">删除这个词条</button>
       </div>
     </div>
     <table class="catalog">
-      <thead><tr><th>图片</th><th>商品</th><th>价格</th><th>销量</th></tr></thead>
+      <thead><tr><th>ID</th><th>图片</th><th>商品</th><th>店名</th><th>价格</th><th>销量</th></tr></thead>
       <tbody>${body}</tbody>
     </table>`;
 }
@@ -174,7 +254,8 @@ function detailPage(tab) {
         <dl>
           <dt>销量</dt><dd>${esc(item.sales || "未知")}</dd>
           <dt>商品编号</dt><dd>${esc(item.goods_id)}</dd>
-          <dt>店铺编号</dt><dd>${esc(item.mall_id || "未知")}</dd>
+          <dt>ID</dt><dd>${esc(item.seq || "")}</dd>
+          <dt>店名</dt><dd>${esc(item.shop_name || "未知")}</dd>
           <dt>词条</dt><dd>${esc(tab.keyword)}</dd>
         </dl>
         <p><a href="${esc(item.url)}" target="_blank" rel="noreferrer">在拼多多打开</a></p>
@@ -196,15 +277,15 @@ function topPage() {
 }
 
 function renderStage() {
-  const tab = state.tabs.find((item) => item.id === state.active);
-  if (!tab) {
+  if (state.section !== "tools") {
     $("stage").innerHTML = topPage();
     return;
   }
-  if (tab.kind === "form") $("stage").innerHTML = searchForm();
-  else if (tab.kind === "search") $("stage").innerHTML = resultPage(tab.keyword);
-  else if (tab.kind === "goods") $("stage").innerHTML = detailPage(tab);
-  else $("stage").innerHTML = topPage();
+  const tab = state.tabs.find((item) => item.id === state.active);
+  if (tab && tab.kind === "goods") $("stage").innerHTML = detailPage(tab);
+  else if (tab && tab.kind === "search") $("stage").innerHTML = resultPage(tab.keyword);
+  else if (state.toolLabel === "搜索词条爬取") $("stage").innerHTML = searchForm();
+  else $("stage").innerHTML = `<h1 class="page-title">功能区概览</h1>`;
 }
 
 function render() {
@@ -218,11 +299,72 @@ async function loadGoods(keyword) {
   state.goods[keyword] = data.goods || [];
 }
 
+async function openEntryMenu(anchor, keyword) {
+  const entry = entryOf(keyword);
+  const rect = anchor.getBoundingClientRect();
+  const menu = document.createElement("div");
+  menu.className = "menu";
+  menu.innerHTML = `<button type="button" data-act="rename">${ICONS.rename}重命名</button><button type="button" data-act="pin">${ICONS.pin}${entry?.pinned ? "取消置顶" : "置顶"}</button><button type="button" data-act="group">${ICONS.group}分组</button><button type="button" data-act="delete">${ICONS.trash}删除</button>`;
+  menu.style.left = `${Math.max(8, rect.left - 80)}px`;
+  menu.style.top = `${rect.bottom + 4}px`;
+  document.body.appendChild(menu);
+  const close = () => menu.remove();
+  menu.onclick = async (event) => {
+    const act = event.target.closest("button")?.dataset.act;
+    close();
+    if (act === "rename") {
+      const title = await askModal({ title: "重命名", text: "这里改的是显示标题，搜索词不会变。", confirmLabel: "保存标题", field: "标题" });
+      if (!title) return;
+      const data = await api("/api/library", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "rename", keyword, title }) });
+      state.library = data.library;
+    }
+    if (act === "pin") {
+      const data = await api("/api/library", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "pin", keyword }) });
+      state.library = data.library;
+    }
+    if (act === "group") await moveKeywords([keyword]);
+    if (act === "delete") {
+      const ok = await askModal({ title: "删除词条", text: `删除「${entry?.title || keyword}」及其已保存商品？删除后不能恢复。`, confirmLabel: "删除词条" });
+      if (ok) await removeKeywords([keyword]);
+      return;
+    }
+    render();
+  };
+  setTimeout(() => document.addEventListener("click", close, { once: true }), 0);
+}
+
+async function moveKeywords(keywords) {
+  const name = await askModal({ title: "归入分组", text: "填写分组名称。没有这个分组时会新建。", confirmLabel: "归入分组", field: "分组名称" });
+  if (!name) return;
+  let group = state.library.groups.find((item) => item.name === name);
+  if (!group) {
+    const created = await api("/api/library", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "create-group", name }) });
+    state.library = created.library;
+    group = state.library.groups.find((item) => item.name === name);
+  }
+  const moved = await api("/api/library", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "move", keywords, groupId: group.id }) });
+  state.library = moved.library;
+  state.multi = false;
+  state.selected = [];
+  render();
+}
+
+async function removeKeywords(keywords) {
+  const data = await api("/api/library", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "delete", keywords }) });
+  state.library = data.library;
+  state.keywords = state.keywords.filter((item) => !keywords.includes(item.keyword));
+  keywords.forEach((keyword) => closeTab(`result:${keyword}`));
+  state.selected = [];
+  state.multi = false;
+}
+
 async function refresh() {
   const data = await api("/api/state");
   const jobChanged = JSON.stringify(data.job) !== JSON.stringify(state.job);
   const keywordsChanged = JSON.stringify(data.keywords) !== JSON.stringify(state.keywords);
   state.keywords = data.keywords || [];
+  if (data.library) state.library = data.library;
+  state.library = data.library || { groups: [], entries: (data.keywords || []).map((item) => ({ ...item, title: item.keyword, pinned: false, groupId: "" })) };
   state.job = data.job || state.job;
   const tab = state.tabs.find((item) => item.id === state.active);
   let goodsChanged = false;
@@ -244,7 +386,9 @@ document.body.addEventListener("click", async (event) => {
   if (section) {
     state.section = section.dataset.section;
     if (state.section === "tools") {
-      openTab({ id: "search-form", title: "搜索词条爬取", kind: "form" });
+      state.toolLabel = "功能区概览";
+      state.active = null;
+      render();
     } else {
       state.active = null;
       state.tabs = state.tabs.filter((item) => item.kind === "search" || item.kind === "goods");
@@ -254,7 +398,10 @@ document.body.addEventListener("click", async (event) => {
     return;
   }
   if (event.target.closest("[data-open-form]")) {
-    openTab({ id: "search-form", title: "搜索词条爬取", kind: "form" });
+    state.toolLabel = "搜索词条爬取";
+    state.active = null;
+    state.section = "tools";
+    render();
     return;
   }
   if (event.target.closest("[data-fold-keywords]")) {
@@ -262,12 +409,54 @@ document.body.addEventListener("click", async (event) => {
     renderNav();
     return;
   }
+  if (event.target.closest("[data-exit-multi]")) { state.multi = false; state.selected = []; renderNav(); return; }
+  const select = event.target.closest("[data-select]");
+  if (select) {
+    state.multi = true;
+    const keyword = select.dataset.select;
+    state.selected = state.selected.includes(keyword) ? state.selected.filter((item) => item !== keyword) : [...state.selected, keyword];
+    renderNav();
+    return;
+  }
+  const more = event.target.closest("[data-more]");
+  if (more) { openEntryMenu(more, more.dataset.more); return; }
+  if (event.target.closest("[data-new-group]")) {
+    const name = await askModal({ title: "新建分组", text: "分组用来整理相关词条。", confirmLabel: "创建分组", field: "分组名称" });
+    if (!name) return;
+    const data = await api("/api/library", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "create-group", name }) });
+    state.library = data.library;
+    render();
+    return;
+  }
+  if (event.target.closest("[data-delete-selected]")) {
+    if (!state.selected.length) return;
+    const ok = await askModal({ title: "删除所选词条", text: `将删除 ${state.selected.length} 个词条及其已保存商品。删除后不能恢复。`, confirmLabel: "删除所选" });
+    if (ok) await removeKeywords(state.selected);
+    return;
+  }
+  if (event.target.closest("[data-group-selected]")) {
+    if (!state.selected.length) return;
+    await moveKeywords(state.selected);
+    return;
+  }
+  const toggleGroup = event.target.closest("[data-toggle-group]");
+  if (toggleGroup) {
+    const data = await api("/api/library", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "toggle-group", groupId: toggleGroup.dataset.toggleGroup }) });
+    state.library = data.library;
+    render();
+    return;
+  }
   const keywordLink = event.target.closest("[data-keyword]");
-  if (keywordLink && keywordLink.matches("a")) {
+  if (keywordLink && !event.target.closest("[data-more], [data-select], [data-open-goods], [data-delete-goods]")) {
     event.preventDefault();
     const keyword = keywordLink.dataset.keyword;
     await loadGoods(keyword);
     openTab({ id: `result:${keyword}`, title: keyword, kind: "search", keyword });
+    return;
+  }
+  if (event.target.closest("[data-fixed]")) {
+    state.active = null;
+    render();
     return;
   }
   const tab = event.target.closest("[data-tab]");
@@ -286,7 +475,8 @@ document.body.addEventListener("click", async (event) => {
   const deleteKeyword = event.target.closest("[data-delete-keyword]");
   if (deleteKeyword) {
     const keyword = deleteKeyword.dataset.deleteKeyword;
-    if (!confirm(`删除「${keyword}」的全部已保存商品？删除后不能恢复。`)) return;
+    const ok = await askModal({ title: "删除词条", text: `删除「${keyword}」及其已保存商品？删除后不能恢复。`, confirmLabel: "删除词条" });
+    if (!ok) return;
     await api(`/api/results?keyword=${encodeURIComponent(keyword)}`, { method: "DELETE" });
     delete state.goods[keyword];
     state.keywords = state.keywords.filter((item) => item.keyword !== keyword);
@@ -297,7 +487,8 @@ document.body.addEventListener("click", async (event) => {
   if (deleteGoods) {
     const keyword = deleteGoods.dataset.keyword;
     const goodsId = deleteGoods.dataset.deleteGoods;
-    if (!confirm("删除这条已保存商品？")) return;
+    const ok = await askModal({ title: "删除这条商品", text: "只删除这一条已保存商品。删除后不能恢复。", confirmLabel: "删除这条" });
+    if (!ok) return;
     await api(`/api/results?keyword=${encodeURIComponent(keyword)}&goods_id=${encodeURIComponent(goodsId)}`, { method: "DELETE" });
     state.goods[keyword] = (state.goods[keyword] || []).filter((item) => item.goods_id !== goodsId);
     closeTab(`goods:${keyword}:${goodsId}`);
@@ -365,6 +556,117 @@ $("nav-toggle").addEventListener("click", () => {
   const open = $("sidebar").classList.toggle("open");
   $("nav-toggle").setAttribute("aria-expanded", String(open));
 });
+
+let copyTarget = null;
+
+function hideCopyMenu() {
+  $("context-menu").hidden = true;
+}
+
+function selectedText(target) {
+  if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA")) {
+    return target.value.slice(target.selectionStart ?? 0, target.selectionEnd ?? 0);
+  }
+  return window.getSelection()?.toString() || "";
+}
+
+async function writeClipboard(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    const box = document.createElement("textarea");
+    box.value = text;
+    document.body.appendChild(box);
+    box.select();
+    document.execCommand("copy");
+    box.remove();
+  }
+}
+
+async function readClipboard() {
+  try {
+    return await navigator.clipboard.readText();
+  } catch {
+    return "";
+  }
+}
+
+function pasteInto(target, text) {
+  const start = target.selectionStart ?? target.value.length;
+  const end = target.selectionEnd ?? start;
+  target.value = target.value.slice(0, start) + text + target.value.slice(end);
+  const next = start + text.length;
+  target.selectionStart = target.selectionEnd = next;
+  target.dispatchEvent(new Event("input", { bubbles: true }));
+  target.focus();
+}
+
+document.addEventListener("contextmenu", (event) => {
+  event.preventDefault();
+  const field = event.target.closest("input, textarea");
+  copyTarget = field || event.target;
+  const menu = $("context-menu");
+  const copy = `<button type="button" data-copy-act="copy" role="menuitem">复制<kbd>Ctrl+C</kbd></button>`;
+  const paste = field ? `<button type="button" data-copy-act="paste" role="menuitem">粘贴<kbd>Ctrl+V</kbd></button>` : "";
+  menu.innerHTML = copy + paste;
+  menu.hidden = false;
+  menu.style.left = `${Math.max(8, Math.min(event.clientX, window.innerWidth - 210))}px`;
+  menu.style.top = `${Math.max(8, Math.min(event.clientY, window.innerHeight - (field ? 90 : 52)))}px`;
+});
+
+$("context-menu").addEventListener("click", async (event) => {
+  const act = event.target.closest("button")?.dataset.copyAct;
+  if (act === "copy") {
+    const text = selectedText(copyTarget) || copyTarget?.innerText || "";
+    if (text.trim()) await writeClipboard(text);
+  }
+  if (act === "paste" && copyTarget) {
+    const text = await readClipboard();
+    if (text) pasteInto(copyTarget, text);
+  }
+  hideCopyMenu();
+});
+
+document.addEventListener("click", (event) => {
+  if (!event.target.closest("#context-menu")) hideCopyMenu();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") hideCopyMenu();
+});
+
+function moveTab(from, to) {
+  if (!from || !to || from === to) return;
+  const moving = state.tabs.find((item) => item.id === from);
+  const target = state.tabs.find((item) => item.id === to);
+  if (!moving || !target || moving.kind !== target.kind) return;
+  if (moving.kind === "goods" && moving.keyword !== target.keyword) return;
+  const next = state.tabs.filter((item) => item.id !== from);
+  next.splice(next.findIndex((item) => item.id === to), 0, moving);
+  state.tabs = next;
+  renderTabs();
+}
+
+function bindTabDrag(row) {
+  row.addEventListener("dragstart", (event) => {
+    const tab = event.target.closest("[data-tab]");
+    if (!tab || event.target.closest("[data-close]")) {
+      event.preventDefault();
+      return;
+    }
+    event.dataTransfer.setData("text/plain", tab.dataset.tab);
+    event.dataTransfer.effectAllowed = "move";
+  });
+  row.addEventListener("dragover", (event) => {
+    if (event.target.closest("[data-tab]")) event.preventDefault();
+  });
+  row.addEventListener("drop", (event) => {
+    event.preventDefault();
+    moveTab(event.dataTransfer.getData("text/plain"), event.target.closest("[data-tab]")?.dataset.tab);
+  });
+}
+
+bindTabDrag($("tabs-main"));
+bindTabDrag($("tabs-detail"));
 
 document.documentElement.dataset.theme = localStorage.getItem("pdd-theme") || "day";
 render();

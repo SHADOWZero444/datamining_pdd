@@ -2,6 +2,7 @@ import json
 import re
 import sys
 import threading
+import time
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -87,9 +88,24 @@ def write_jsonl(path, rows):
     path.write_text(text + ("\n" if text else ""), encoding="utf-8")
 
 
+def ensure_seq(rows):
+    """给没有序号的商品补一个不重复的 ID。已有序号保持不变。"""
+    used = [int(row["seq"]) for row in rows if str(row.get("seq", "")).isdigit()]
+    next_id = max(used, default=0) + 1
+    changed = False
+    for row in rows:
+        if not str(row.get("seq", "")).isdigit():
+            row["seq"] = next_id
+            next_id += 1
+            changed = True
+    return changed
+
+
 def load_goods(keyword):
     rows = read_jsonl(result_path(keyword))
     if rows:
+        if ensure_seq(rows):
+            write_jsonl(result_path(keyword), rows)
         return rows
     # 还没抓过时，用你保存的搜索页，方便界面先看到真实商品。
     saved = ROOT / "pdd.html"
@@ -97,6 +113,93 @@ def load_goods(keyword):
         from pdd_search import parse_goods
         return parse_goods(saved.read_text(encoding="utf-8", errors="replace"))
     return []
+
+
+LIBRARY_FILE = ROOT / "data" / "library.json"
+
+
+def load_library():
+    if LIBRARY_FILE.exists():
+        try:
+            data = json.loads(LIBRARY_FILE.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            data = {"groups": [], "entries": []}
+    else:
+        data = {"groups": [], "entries": []}
+    data.setdefault("groups", [])
+    data.setdefault("entries", [])
+    known = {item.get("keyword") for item in data["entries"]}
+    if DATA_DIR.exists():
+        for path in DATA_DIR.glob("*.jsonl"):
+            rows = read_jsonl(path)
+            keyword = rows[0].get("keyword") if rows and rows[0].get("keyword") else path.stem
+            if keyword not in known:
+                data["entries"].append({"keyword": keyword, "title": keyword, "pinned": False, "groupId": ""})
+                known.add(keyword)
+    return data
+
+
+def save_library(data):
+    LIBRARY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    LIBRARY_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def library_state():
+    library = load_library()
+    entries = []
+    for entry in library["entries"]:
+        keyword = entry.get("keyword") or ""
+        if not keyword:
+            continue
+        entries.append({
+            "keyword": keyword,
+            "title": entry.get("title") or keyword,
+            "pinned": bool(entry.get("pinned")),
+            "groupId": entry.get("groupId") or "",
+            "count": len(read_jsonl(result_path(keyword))),
+        })
+    entries.sort(key=lambda item: (not item["pinned"], item["title"]))
+    return {"groups": library["groups"], "entries": entries}
+
+
+def update_library(payload):
+    library = load_library()
+    action = payload.get("action")
+    if action == "create-group":
+        name = str(payload.get("name") or "").strip()
+        if not name:
+            raise RuntimeError("请填写分组名称。")
+        library["groups"].append({"id": f"g{int(time.time())}", "name": name, "open": True})
+    elif action == "toggle-group":
+        group = next((item for item in library["groups"] if item["id"] == payload.get("groupId")), None)
+        if group:
+            group["open"] = not group.get("open", True)
+    elif action == "rename":
+        entry = next((item for item in library["entries"] if item.get("keyword") == payload.get("keyword")), None)
+        title = str(payload.get("title") or "").strip()
+        if not entry or not title:
+            raise RuntimeError("请填写新的标题。")
+        entry["title"] = title
+    elif action == "pin":
+        entry = next((item for item in library["entries"] if item.get("keyword") == payload.get("keyword")), None)
+        if entry:
+            entry["pinned"] = not entry.get("pinned")
+    elif action == "move":
+        keywords = payload.get("keywords") or ([payload.get("keyword")] if payload.get("keyword") else [])
+        for entry in library["entries"]:
+            if entry.get("keyword") in keywords:
+                entry["groupId"] = payload.get("groupId") or ""
+    elif action == "delete":
+        keywords = set(payload.get("keywords") or [])
+        library["entries"] = [item for item in library["entries"] if item.get("keyword") not in keywords]
+        for keyword in keywords:
+            path = result_path(keyword)
+            if path.exists():
+                path.unlink()
+    else:
+        raise RuntimeError("无法处理这个操作。")
+    save_library(library)
+    return {"ok": True, "library": library_state()}
 
 
 def list_keywords():
@@ -118,8 +221,13 @@ def merge_goods(keyword, new_rows):
         goods_id = row.get("goods_id")
         if not goods_id:
             continue
-        merged[goods_id] = {**merged.get(goods_id, {}), **row}
+        previous = merged.get(goods_id, {})
+        row["seq"] = previous.get("seq") or row.get("seq")
+        if not row.get("shop_name"):
+            row["shop_name"] = previous.get("shop_name") or ""
+        merged[goods_id] = {**previous, **row}
     rows = list(merged.values())
+    ensure_seq(rows)
     if rows:
         write_jsonl(result_path(keyword), rows)
     return rows
@@ -168,7 +276,7 @@ class AppHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/state":
             with job_lock:
                 current = dict(job)
-            self.send_json({"keywords": list_keywords(), "job": current})
+            self.send_json({"keywords": list_keywords(), "library": library_state(), "job": current})
             return
         if parsed.path == "/api/results":
             keyword = parse_qs(parsed.query).get("keyword", [""])[0]
@@ -199,6 +307,19 @@ class AppHandler(SimpleHTTPRequestHandler):
         self.send_json({"ok": True, "count": 0})
 
     def do_POST(self):
+        path = urlparse(self.path).path
+        if path == "/api/library":
+            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+            except json.JSONDecodeError:
+                self.send_json({"ok": False, "message": "请求格式不对"}, 400)
+                return
+            try:
+                self.send_json(update_library(payload))
+            except RuntimeError as exc:
+                self.send_json({"ok": False, "message": str(exc)}, 400)
+            return
         if urlparse(self.path).path != "/api/search":
             self.send_error(404)
             return
