@@ -1,11 +1,14 @@
 import json
 import os
 import re
+import socket
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, urljoin
+from urllib.request import urlopen
 
 # 打包成 exe 后，程序会去自己的目录找浏览器。这里改成用本机已经装好的浏览器。
 _local_browsers = Path(os.environ.get("LOCALAPPDATA", "")) / "ms-playwright"
@@ -92,46 +95,78 @@ def has_login_cookie(items):
     return "pddaccesstoken" in names or ({"pdd_user_id", "pdd_user_uin"} <= names)
 
 
+def normal_browser_executable():
+    """寻找真实安装的浏览器，而不是由 Playwright 启动的自动化浏览器。"""
+    roots = [
+        Path(os.environ.get("PROGRAMFILES(X86)", "")),
+        Path(os.environ.get("PROGRAMFILES", "")),
+        Path(os.environ.get("LOCALAPPDATA", "")),
+    ]
+    candidates = []
+    for root in roots:
+        if root:
+            candidates.extend([
+                root / "Microsoft" / "Edge" / "Application" / "msedge.exe",
+                root / "Google" / "Chrome" / "Application" / "chrome.exe",
+            ])
+    return next((path for path in candidates if path.is_file()), None)
+
+
+def available_debug_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
 def open_login_and_capture_cookie(timeout_seconds=600):
-    """在独立的本机浏览器资料夹完成登录，再导出该站点的登录 cookie。"""
+    """用独立的真实浏览器窗口登录，只读取该窗口里的拼多多 cookie。"""
+    executable = normal_browser_executable()
+    if not executable:
+        raise RuntimeError("无法找到 Microsoft Edge 或 Chrome，请安装其中一个浏览器后重试。")
     profile = program_dir() / "data" / "login-browser"
     profile.mkdir(parents=True, exist_ok=True)
-    with sync_playwright() as browser_factory:
-        context = None
-        first_error = None
-        for channel in (None, "msedge", "chrome"):
-            try:
-                options = {
-                    "headless": False,
-                    "user_agent": PHONE_UA,
-                    "viewport": {"width": 390, "height": 844},
-                    "locale": "zh-CN",
-                }
-                if channel:
-                    options["channel"] = channel
-                context = browser_factory.chromium.launch_persistent_context(str(profile), **options)
-                break
-            except Exception as exc:
-                first_error = exc
-        if context is None:
-            raise RuntimeError("无法打开登录浏览器，请安装 Microsoft Edge 或 Chrome 后重试。") from first_error
-        try:
-            page = context.pages[0] if context.pages else context.new_page()
-            page.goto("https://mobile.pinduoduo.com/login.html", wait_until="domcontentloaded", timeout=30000)
+    port = available_debug_port()
+    process = subprocess.Popen(
+        [
+            str(executable),
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={profile}",
+            "--new-window",
+            "https://mobile.pinduoduo.com/login.html",
+        ],
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    browser = None
+    try:
+        endpoint = f"http://127.0.0.1:{port}"
+        startup_deadline = time.monotonic() + 20
+        with sync_playwright() as browser_factory:
+            while time.monotonic() < startup_deadline:
+                try:
+                    urlopen(f"{endpoint}/json/version", timeout=1).close()
+                    browser = browser_factory.chromium.connect_over_cdp(endpoint)
+                    break
+                except Exception:
+                    if process.poll() is not None:
+                        raise RuntimeError("登录浏览器未能启动。")
+                    time.sleep(0.5)
+            if browser is None:
+                raise RuntimeError("登录浏览器启动超时，请重试。")
             deadline = time.monotonic() + timeout_seconds
             while time.monotonic() < deadline:
                 items = [
-                    item for item in context.cookies()
+                    item for context in browser.contexts for item in context.cookies()
                     if str(item.get("domain") or "").lstrip(".").endswith("pinduoduo.com")
                 ]
                 if has_login_cookie(items):
                     return cookie_header(items)
-                if page.is_closed():
+                if process.poll() is not None:
                     raise RuntimeError("登录窗口已关闭，尚未获取到登录信息。")
-                page.wait_for_timeout(1000)
+                time.sleep(1)
             raise RuntimeError("等待登录超时，请重新点击“前往获取”。")
-        finally:
-            context.close()
+    finally:
+        if process.poll() is None:
+            process.terminate()
 
 
 def read_js_string(block, key):

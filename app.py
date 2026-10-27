@@ -260,11 +260,27 @@ def update_library(payload):
         name = str(payload.get("name") or "").strip()
         if not name:
             raise RuntimeError("请填写分组名称。")
-        library["groups"].append({"id": f"g{int(time.time())}", "name": name, "open": True})
+        library["groups"].append({"id": f"g{int(time.time())}", "name": name, "open": True, "pinned": False})
     elif action == "toggle-group":
         group = next((item for item in library["groups"] if item["id"] == payload.get("groupId")), None)
         if group:
             group["open"] = not group.get("open", True)
+    elif action in ("rename-group", "pin-group", "delete-group"):
+        group = next((item for item in library["groups"] if item["id"] == payload.get("groupId")), None)
+        if not group:
+            raise RuntimeError("没有找到这个分组。")
+        if action == "rename-group":
+            name = str(payload.get("name") or "").strip()
+            if not name:
+                raise RuntimeError("请填写新的分组名称。")
+            group["name"] = name
+        elif action == "pin-group":
+            group["pinned"] = not group.get("pinned", False)
+        else:
+            for entry in library["entries"]:
+                if entry.get("groupId") == group["id"]:
+                    entry["groupId"] = ""
+            library["groups"] = [item for item in library["groups"] if item.get("id") != group["id"]]
     elif action == "rename":
         entry = next((item for item in library["entries"] if item.get("keyword") == payload.get("keyword")), None)
         title = str(payload.get("title") or "").strip()
@@ -495,11 +511,16 @@ class AppHandler(SimpleHTTPRequestHandler):
         if len(keyword) > 40:
             self.send_json({"ok": False, "message": "搜索词不要超过 40 个字"}, 400)
             return
-        limit = payload.get("limit") or 300
+        raw_limit = payload.get("limit")
+        limit = 300 if raw_limit in (None, "") else raw_limit
         try:
-            limit = max(20, min(500, int(limit)))
+            limit = int(limit)
         except (TypeError, ValueError):
-            limit = 300
+            self.send_json({"ok": False, "message": "本次抓取条数请填写正整数。"}, 400)
+            return
+        if not 1 <= limit <= 10000:
+            self.send_json({"ok": False, "message": "本次抓取条数请填写 1 到 10000 之间的整数。"}, 400)
+            return
         filters = read_filters(payload)
         with job_lock:
             if job["running"]:

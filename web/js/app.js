@@ -28,7 +28,7 @@ const state = {
   metadata: {},
   views: {},
   auth: { running: false, status: "idle", message: "正在读取登录状态…", configured: false, cookie: "" },
-  form: { keyword: "", priceMin: "", priceMax: "", banned: "", tags: [] },
+  form: { keyword: "", priceMin: "", priceMax: "", banned: "", tags: [], limit: "300" },
 };
 
 const $ = (id) => document.getElementById(id);
@@ -171,11 +171,17 @@ function renderNav() {
       ${item.pinned ? `<span class="pin-mark" title="已置顶">${ICONS.pin}</span>` : ""}
       <button class="more" type="button" data-more="${esc(item.keyword)}" aria-label="${esc(item.title)}的操作">${ICONS.more}</button>
     </div>`;
-  const groups = state.library.groups.map((group) => `
-    <div>
-      <button class="group-toggle" type="button" data-toggle-group="${esc(group.id)}"><span class="nav-label">${group.open === false ? "展开" : "收起"} ${esc(group.name)}</span></button>
-      <div class="sub-list" ${group.open === false ? "hidden" : ""}>${entries.filter((item) => item.groupId === group.id).map(renderEntry).join("") || '<p class="help">这个分组还没有词条。</p>'}</div>
-    </div>`).join("");
+  const groups = [...state.library.groups]
+    .sort((a, b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)))
+    .map((group) => `
+      <div class="group-block">
+        <div class="group-head">
+          <button class="group-toggle" type="button" data-toggle-group="${esc(group.id)}" aria-expanded="${group.open !== false}"><span class="group-arrow ${group.open === false ? "" : "is-open"}" aria-hidden="true"></span><span class="nav-label">${esc(group.name)}</span></button>
+          ${group.pinned ? `<span class="pin-mark" title="已置顶">${ICONS.pin}</span>` : ""}
+          <button class="more" type="button" data-group-more="${esc(group.id)}" aria-label="${esc(group.name)}的操作">${ICONS.more}</button>
+        </div>
+        <div class="sub-list" ${group.open === false ? "hidden" : ""}>${entries.filter((item) => item.groupId === group.id).map(renderEntry).join("") || '<p class="help">这个分组还没有词条。</p>'}</div>
+      </div>`).join("");
   const loose = entries.filter((item) => !item.groupId).map(renderEntry).join("");
   const tools = state.section === "tools" ? `
     <div class="sub-head">
@@ -256,6 +262,11 @@ function searchForm() {
         <input id="banned" name="banned" type="text" value="${esc(state.form.banned)}" autocomplete="off">
         <p class="help">多个禁用词请用英文逗号 , 分隔。例如：二手,翻新</p>
       </div>
+      <div class="scrape-limit">
+        <label class="field-label" for="scrape-limit">本次抓取数据限制</label>
+        <div class="limit-input"><input id="scrape-limit" name="limit" type="number" min="1" max="10000" step="1" inputmode="numeric" required value="${esc(state.form.limit)}"></div>
+        <p class="help">抓到指定条数后会自动停止。本次最多可设置 10000 条。</p>
+      </div>
       <p class="error" id="form-error" role="alert"></p>
       <button class="start" type="submit" ${state.job.running ? "disabled" : ""}>${state.job.running ? "正在抓取" : "开始"}</button>
     </form>`;
@@ -303,7 +314,7 @@ function resultPage(keyword) {
       </div>
     </div>
     <section class="table-controls" aria-label="数据列表显示方式">
-      <div class="control-group"><label for="page-size-${esc(keyword)}">每页显示</label><select id="page-size-${esc(keyword)}" data-page-size="${esc(keyword)}"><option value="50" ${view.pageSize === 50 ? "selected" : ""}>50 条</option><option value="100" ${view.pageSize === 100 ? "selected" : ""}>100 条</option><option value="200" ${view.pageSize === 200 ? "selected" : ""}>200 条</option><option value="500" ${view.pageSize === 500 ? "selected" : ""}>500 条</option></select></div>
+      <form class="control-group" data-page-size-form="${esc(keyword)}"><label for="page-size-${esc(keyword)}">每页显示</label><input id="page-size-${esc(keyword)}" name="pageSize" type="number" min="1" max="10000" step="1" inputmode="numeric" value="${esc(view.pageSize)}"><span>条</span><button class="ghost" type="submit">应用</button></form>
       <form class="range-filter" data-range-form="${esc(keyword)}"><label for="start-id-${esc(keyword)}">序号范围</label><input id="start-id-${esc(keyword)}" name="startId" type="number" min="1" placeholder="起始 ID" value="${esc(view.startId)}"><span>至</span><input name="endId" type="number" min="1" placeholder="结束 ID" value="${esc(view.endId)}"><button class="ghost" type="submit">应用</button><button class="text-btn" type="button" data-clear-range="${esc(keyword)}">清除</button></form>
       <p class="table-count">显示 ${pageRows.length ? (view.page - 1) * view.pageSize + 1 : 0}–${Math.min(view.page * view.pageSize, visibleRows.length)} / ${visibleRows.length} 条${visibleRows.length !== rows.length ? `（共 ${rows.length} 条）` : ""}</p>
     </section>
@@ -311,7 +322,7 @@ function resultPage(keyword) {
       <thead><tr>${sortHeader("seq", "ID")}<th>图片</th>${sortHeader("title", "商品")}${sortHeader("shop_name", "店名")}${sortHeader("price", "价格")}${sortHeader("sales", "销量")}</tr></thead>
       <tbody>${body}</tbody>
     </table>
-    <nav class="pagination" aria-label="商品列表翻页"><button class="ghost" type="button" data-page-step="prev" data-page-keyword="${esc(keyword)}" ${view.page === 1 ? "disabled" : ""}>上一页</button><span>第 ${view.page} / ${pageCount} 页</span><button class="ghost" type="button" data-page-step="next" data-page-keyword="${esc(keyword)}" ${view.page === pageCount ? "disabled" : ""}>下一页</button></nav>`;
+    <nav class="pagination" aria-label="商品列表翻页"><button class="ghost" type="button" data-page-step="prev" data-page-keyword="${esc(keyword)}" ${view.page === 1 ? "disabled" : ""}>上一页</button><form class="page-jump" data-page-form="${esc(keyword)}"><label for="page-number-${esc(keyword)}">第</label><input id="page-number-${esc(keyword)}" name="page" type="number" min="1" max="${pageCount}" step="1" inputmode="numeric" value="${view.page}"><span>/ ${pageCount} 页</span><button class="ghost" type="submit">跳转</button></form><button class="ghost" type="button" data-page-step="next" data-page-keyword="${esc(keyword)}" ${view.page === pageCount ? "disabled" : ""}>下一页</button></nav>`;
 }
 
 function detailPage(tab) {
@@ -421,6 +432,45 @@ async function openEntryMenu(anchor, keyword) {
       return;
     }
     render();
+  };
+  setTimeout(() => document.addEventListener("click", close, { once: true }), 0);
+}
+
+async function openGroupMenu(anchor, groupId) {
+  const group = state.library.groups.find((item) => item.id === groupId);
+  if (!group) return;
+  const rect = anchor.getBoundingClientRect();
+  const menu = document.createElement("div");
+  menu.className = "menu";
+  menu.innerHTML = `<button type="button" data-group-act="rename">${ICONS.rename}重命名</button><button type="button" data-group-act="pin">${ICONS.pin}${group.pinned ? "取消置顶" : "置顶"}</button><button type="button" data-group-act="delete">${ICONS.trash}删除分组</button>`;
+  menu.style.left = `${Math.max(8, rect.left - 112)}px`;
+  menu.style.top = `${rect.bottom + 4}px`;
+  document.body.appendChild(menu);
+  const close = () => menu.remove();
+  menu.onclick = async (event) => {
+    const act = event.target.closest("button")?.dataset.groupAct;
+    close();
+    try {
+      if (act === "rename") {
+        const name = await askModal({ title: "重命名分组", text: "词条和已保存的数据不会受影响。", confirmLabel: "保存名称", field: "分组名称" });
+        if (!name) return;
+        const data = await api("/api/library", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "rename-group", groupId, name }) });
+        state.library = data.library;
+      }
+      if (act === "pin") {
+        const data = await api("/api/library", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "pin-group", groupId }) });
+        state.library = data.library;
+      }
+      if (act === "delete") {
+        const ok = await askModal({ title: "删除分组", text: `删除「${group.name}」分组？其中的词条和已保存数据会保留，并回到未分组列表。`, confirmLabel: "删除分组" });
+        if (!ok) return;
+        const data = await api("/api/library", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "delete-group", groupId }) });
+        state.library = data.library;
+      }
+      render();
+    } catch (exc) {
+      render();
+    }
   };
   setTimeout(() => document.addEventListener("click", close, { once: true }), 0);
 }
@@ -578,6 +628,8 @@ document.body.addEventListener("click", async (event) => {
   }
   const more = event.target.closest("[data-more]");
   if (more) { openEntryMenu(more, more.dataset.more); return; }
+  const groupMore = event.target.closest("[data-group-more]");
+  if (groupMore) { openGroupMenu(groupMore, groupMore.dataset.groupMore); return; }
   if (event.target.closest("[data-new-group]")) {
     const name = await askModal({ title: "新建分组", text: "分组用来整理相关词条。", confirmLabel: "创建分组", field: "分组名称" });
     if (!name) return;
@@ -683,6 +735,30 @@ document.body.addEventListener("submit", async (event) => {
     render();
     return;
   }
+  const pageSizeForm = event.target.closest("[data-page-size-form]");
+  if (pageSizeForm) {
+    event.preventDefault();
+    const keyword = pageSizeForm.dataset.pageSizeForm;
+    const pageSize = Number(new FormData(pageSizeForm).get("pageSize"));
+    if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 10000) return;
+    const view = viewOf(keyword);
+    view.pageSize = pageSize;
+    view.page = 1;
+    renderStage();
+    return;
+  }
+  const pageForm = event.target.closest("[data-page-form]");
+  if (pageForm) {
+    event.preventDefault();
+    const keyword = pageForm.dataset.pageForm;
+    const view = viewOf(keyword);
+    const pageCount = Math.max(1, Math.ceil(sortedAndRangedRows(keyword).length / view.pageSize));
+    const page = Number(new FormData(pageForm).get("page"));
+    if (!Number.isInteger(page) || page < 1 || page > pageCount) return;
+    view.page = page;
+    renderStage();
+    return;
+  }
   const rangeForm = event.target.closest("[data-range-form]");
   if (rangeForm) {
     event.preventDefault();
@@ -705,9 +781,10 @@ document.body.addEventListener("submit", async (event) => {
   const priceMin = String(form.get("priceMin") || "").trim();
   const priceMax = String(form.get("priceMax") || "").trim();
   const banned = String(form.get("banned") || "").trim();
+  const limit = String(form.get("limit") || "").trim();
   const tags = form.getAll("tags");
   const error = document.getElementById("form-error");
-  state.form = { keyword, priceMin, priceMax, banned, tags };
+  state.form = { keyword, priceMin, priceMax, banned, tags, limit };
   if (!keyword) {
     error.textContent = "请填写搜索词。";
     return;
@@ -720,12 +797,16 @@ document.body.addEventListener("submit", async (event) => {
     error.textContent = "请使用英文逗号 , 分隔禁用词。";
     return;
   }
+  if (!/^[1-9]\d*$/.test(limit) || Number(limit) > 10000) {
+    error.textContent = "本次抓取数据限制请填写 1 到 10000 之间的整数。";
+    return;
+  }
   error.textContent = "";
   try {
     await api("/api/search", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ keyword, limit: 300, tags, banned, price_min: priceMin, price_max: priceMax }),
+      body: JSON.stringify({ keyword, limit, tags, banned, price_min: priceMin, price_max: priceMax }),
     });
     if (!state.keywords.some((item) => item.keyword === keyword)) state.keywords.push({ keyword, count: 0 });
     openTab({ id: `result:${keyword}`, title: keyword, kind: "search", keyword });
@@ -739,13 +820,6 @@ document.body.addEventListener("change", (event) => {
     document.documentElement.dataset.theme = event.target.value;
     localStorage.setItem("pdd-theme", event.target.value);
     return;
-  }
-  const keyword = event.target.dataset.pageSize;
-  if (keyword) {
-    const view = viewOf(keyword);
-    view.pageSize = Number(event.target.value) || 100;
-    view.page = 1;
-    renderStage();
   }
 });
 
