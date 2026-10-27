@@ -52,6 +52,23 @@ function numericValue(value) {
   return text.includes("万") ? number * 10000 : number;
 }
 
+// 每页条数和序号范围一起生效。任一栏填错，两项都不改。
+function applyListTools(form) {
+  const keyword = form.dataset.listTools;
+  const values = new FormData(form);
+  const pageSize = Number(values.get("pageSize"));
+  const startId = String(values.get("startId") || "").trim();
+  const endId = String(values.get("endId") || "").trim();
+  if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 10000) return;
+  if (startId && endId && Number(startId) > Number(endId)) return;
+  const view = viewOf(keyword);
+  view.pageSize = pageSize;
+  view.startId = startId;
+  view.endId = endId;
+  view.page = 1;
+  renderStage();
+}
+
 function viewOf(keyword) {
   if (!state.views[keyword]) {
     state.views[keyword] = { page: 1, pageSize: 100, startId: "", endId: "", sort: null };
@@ -314,8 +331,12 @@ function resultPage(keyword) {
       </div>
     </div>
     <section class="table-controls" aria-label="数据列表显示方式">
-      <form class="control-group" data-page-size-form="${esc(keyword)}"><label for="page-size-${esc(keyword)}">每页显示</label><input id="page-size-${esc(keyword)}" name="pageSize" type="number" min="1" max="10000" step="1" inputmode="numeric" value="${esc(view.pageSize)}"><span>条</span><button class="ghost" type="submit">应用</button></form>
-      <form class="range-filter" data-range-form="${esc(keyword)}"><label for="start-id-${esc(keyword)}">序号范围</label><input id="start-id-${esc(keyword)}" name="startId" type="number" min="1" placeholder="起始 ID" value="${esc(view.startId)}"><span>至</span><input name="endId" type="number" min="1" placeholder="结束 ID" value="${esc(view.endId)}"><button class="ghost" type="submit">应用</button><button class="text-btn" type="button" data-clear-range="${esc(keyword)}">清除</button></form>
+      <form class="list-tools" data-list-tools="${esc(keyword)}">
+        <div class="control-group"><label for="page-size-${esc(keyword)}">每页显示</label><input id="page-size-${esc(keyword)}" name="pageSize" type="number" min="1" max="10000" step="1" inputmode="numeric" value="${esc(view.pageSize)}"><span>条</span></div>
+        <div class="range-filter"><label for="start-id-${esc(keyword)}">序号范围</label><input id="start-id-${esc(keyword)}" name="startId" type="number" min="1" placeholder="起始 ID" value="${esc(view.startId)}"><span>至</span><input name="endId" type="number" min="1" placeholder="结束 ID" value="${esc(view.endId)}"></div>
+        <button class="list-apply" type="submit">应用</button>
+        <button class="text-btn" type="button" data-clear-range="${esc(keyword)}">清除</button>
+      </form>
       <p class="table-count">显示 ${pageRows.length ? (view.page - 1) * view.pageSize + 1 : 0}–${Math.min(view.page * view.pageSize, visibleRows.length)} / ${visibleRows.length} 条${visibleRows.length !== rows.length ? `（共 ${rows.length} 条）` : ""}</p>
     </section>
     <table class="catalog">
@@ -735,16 +756,10 @@ document.body.addEventListener("submit", async (event) => {
     render();
     return;
   }
-  const pageSizeForm = event.target.closest("[data-page-size-form]");
-  if (pageSizeForm) {
+  const listTools = event.target.closest("[data-list-tools]");
+  if (listTools) {
     event.preventDefault();
-    const keyword = pageSizeForm.dataset.pageSizeForm;
-    const pageSize = Number(new FormData(pageSizeForm).get("pageSize"));
-    if (!Number.isInteger(pageSize) || pageSize < 1 || pageSize > 10000) return;
-    const view = viewOf(keyword);
-    view.pageSize = pageSize;
-    view.page = 1;
-    renderStage();
+    applyListTools(listTools);
     return;
   }
   const pageForm = event.target.closest("[data-page-form]");
@@ -759,21 +774,7 @@ document.body.addEventListener("submit", async (event) => {
     renderStage();
     return;
   }
-  const rangeForm = event.target.closest("[data-range-form]");
-  if (rangeForm) {
-    event.preventDefault();
-    const keyword = rangeForm.dataset.rangeForm;
-    const values = new FormData(rangeForm);
-    const startId = String(values.get("startId") || "").trim();
-    const endId = String(values.get("endId") || "").trim();
-    if (startId && endId && Number(startId) > Number(endId)) return;
-    const view = viewOf(keyword);
-    view.startId = startId;
-    view.endId = endId;
-    view.page = 1;
-    renderStage();
-    return;
-  }
+
   if (event.target.id !== "search-form") return;
   event.preventDefault();
   const form = new FormData(event.target);

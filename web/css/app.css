@@ -414,12 +414,22 @@ input[type="text"], input[type="number"] {
 .stop { display: inline-flex; align-items: center; justify-content: center; height: 36px; padding: 0 14px; border: 1px solid var(--danger); border-radius: 8px; background: var(--paper); color: var(--danger); font-size: 14px; }
 .stop:hover { background: var(--danger); color: var(--paper); }
 .table-controls { display: flex; flex-wrap: wrap; align-items: end; gap: 12px 20px; margin: 24px 0 10px; padding: 12px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.list-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
 .control-group, .range-filter { display: flex; align-items: center; gap: 8px; }
 .control-group label, .range-filter label { color: var(--muted); font-size: 13px; white-space: nowrap; }
 .control-group select, .range-filter input { height: 34px; border: 1px solid var(--line); border-radius: 7px; background: var(--paper); color: var(--ink); padding: 0 9px; }
 .control-group input { width: 86px; height: 34px; border: 1px solid var(--line); border-radius: 7px; background: var(--paper); color: var(--ink); padding: 0 9px; }
 .range-filter input { width: 96px; }
-.range-filter .ghost, .control-group .ghost { height: 34px; }
+.list-apply {
+  height: 34px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--paper);
+  font-size: 13px;
+  white-space: nowrap;
+}
+.list-apply:hover { background: var(--fill); }
 .text-btn { height: 34px; padding: 0 4px; border: 0; background: transparent; color: var(--muted); text-decoration: underline; text-underline-offset: 3px; font-size: 13px; }
 .text-btn:hover { color: var(--ink); }
 .table-count { margin: 0 0 1px auto; color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
@@ -477,7 +487,7 @@ input[type="text"], input[type="number"] {
   .detail, .range { display: block; }
   .range input { width: 100%; margin-bottom: 8px; }
   .table-controls { align-items: stretch; }
-  .range-filter { flex-wrap: wrap; }
+  .list-tools, .range-filter { flex-wrap: wrap; }
   .table-count { width: 100%; margin-left: 0; }
   .pagination { justify-content: flex-start; }
 }
