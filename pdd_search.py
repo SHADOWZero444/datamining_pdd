@@ -22,6 +22,15 @@ SAFETY_LIMIT = 500
 BASE = "https://mobile.pinduoduo.com/"
 
 
+class SearchCancelled(RuntimeError):
+    """保留已读取的数据并正常结束用户主动停止的抓取。"""
+
+    def __init__(self, goods, total):
+        super().__init__("已停止抓取")
+        self.goods = goods
+        self.total = total
+
+
 def program_dir():
     """软件本体所在的文件夹。打包后是 exe 旁边，开发时是项目目录。"""
     if getattr(sys, "frozen", False):
@@ -71,6 +80,58 @@ def load_cookie_items():
     if not items:
         raise RuntimeError("cookie.txt 里没有有效内容")
     return items
+
+
+def cookie_header(items):
+    return "; ".join(f"{item['name']}={item['value']}" for item in items if item.get("name") and item.get("value"))
+
+
+def has_login_cookie(items):
+    """只接受登录后才会出现的身份标记，避免把初始访客 cookie 当作成功。"""
+    names = {str(item.get("name") or "").casefold() for item in items}
+    return "pddaccesstoken" in names or ({"pdd_user_id", "pdd_user_uin"} <= names)
+
+
+def open_login_and_capture_cookie(timeout_seconds=600):
+    """在独立的本机浏览器资料夹完成登录，再导出该站点的登录 cookie。"""
+    profile = program_dir() / "data" / "login-browser"
+    profile.mkdir(parents=True, exist_ok=True)
+    with sync_playwright() as browser_factory:
+        context = None
+        first_error = None
+        for channel in (None, "msedge", "chrome"):
+            try:
+                options = {
+                    "headless": False,
+                    "user_agent": PHONE_UA,
+                    "viewport": {"width": 390, "height": 844},
+                    "locale": "zh-CN",
+                }
+                if channel:
+                    options["channel"] = channel
+                context = browser_factory.chromium.launch_persistent_context(str(profile), **options)
+                break
+            except Exception as exc:
+                first_error = exc
+        if context is None:
+            raise RuntimeError("无法打开登录浏览器，请安装 Microsoft Edge 或 Chrome 后重试。") from first_error
+        try:
+            page = context.pages[0] if context.pages else context.new_page()
+            page.goto("https://mobile.pinduoduo.com/login.html", wait_until="domcontentloaded", timeout=30000)
+            deadline = time.monotonic() + timeout_seconds
+            while time.monotonic() < deadline:
+                items = [
+                    item for item in context.cookies()
+                    if str(item.get("domain") or "").lstrip(".").endswith("pinduoduo.com")
+                ]
+                if has_login_cookie(items):
+                    return cookie_header(items)
+                if page.is_closed():
+                    raise RuntimeError("登录窗口已关闭，尚未获取到登录信息。")
+                page.wait_for_timeout(1000)
+            raise RuntimeError("等待登录超时，请重新点击“前往获取”。")
+        finally:
+            context.close()
 
 
 def read_js_string(block, key):
@@ -336,10 +397,26 @@ def goods_from_api(data):
     return rows
 
 
-def collect(page, limit=None):
+def wait_with_cancel(page, milliseconds, should_stop):
+    """把等待拆短，让“停止”不会被滚动间隔卡住。"""
+    remaining = milliseconds
+    while remaining > 0:
+        if should_stop and should_stop():
+            return False
+        step = min(200, remaining)
+        page.wait_for_timeout(step)
+        remaining -= step
+    return True
+
+
+def collect(page, limit=None, should_stop=None, progress=None):
     seen = {}
     total = None
     blocked = []
+
+    def check_cancelled():
+        if should_stop and should_stop():
+            raise SearchCancelled(list(seen.values()), total)
 
     def on_response(response):
         nonlocal total
@@ -358,6 +435,9 @@ def collect(page, limit=None):
             seen[row["goods_id"]] = row
 
     page.on("response", on_response)
+    check_cancelled()
+    if progress:
+        progress("正在打开搜索页…", 0, None)
     page.goto(search_url(SEARCH_VALUE), wait_until="domcontentloaded", timeout=30000)
     try:
         page.wait_for_function(
@@ -382,6 +462,8 @@ def collect(page, limit=None):
             seen[item["goods_id"]] = item
 
     absorb()
+    if progress:
+        progress(f"正在抓取，已读取 {len(seen)} 条", len(seen), total)
     if not seen:
         title = page.title()
         raise RuntimeError(f"没有读到商品。当前页面是：{title}")
@@ -389,13 +471,15 @@ def collect(page, limit=None):
     stalls = 0
     cap = limit if limit else SAFETY_LIMIT
     while len(seen) < cap:
+        check_cancelled()
         if total and len(seen) >= total:
             break
         before = len(seen)
         page.mouse.move(180, 520)
         page.mouse.wheel(0, 6000)
         page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
-        page.wait_for_timeout(1600)
+        if not wait_with_cancel(page, 1600, should_stop):
+            check_cancelled()
         absorb()
         if len(seen) == before:
             stalls += 1
@@ -406,9 +490,12 @@ def collect(page, limit=None):
         else:
             stalls = 0
             print(f"已收集 {len(seen)} 条" + (f" / {total}" if total else ""))
+        if progress:
+            progress(f"正在抓取，已读取 {len(seen)} 条", len(seen), total)
         if stalls >= 4:
             break
-        time.sleep(1.5)
+        if not wait_with_cancel(page, 1500, should_stop):
+            check_cancelled()
     if blocked:
         print(f"翻页接口被拒绝 {len(blocked)} 次，状态码 {blocked[-1]}")
     if total and len(seen) < total:
@@ -474,7 +561,7 @@ def main():
     print(f"共 {len(goods)} 条，已写入 {OUTPUT_FILE.name}")
 
 
-def run_search(keyword, limit=None, filters=None):
+def run_search(keyword, limit=None, filters=None, cancel_event=None, progress=None):
     """给界面调用。keyword 是搜索词，limit 是这次最多收多少条。"""
     global SEARCH_VALUE
     SEARCH_VALUE = (keyword or "").strip()
@@ -493,7 +580,15 @@ def run_search(keyword, limit=None, filters=None):
         context.add_cookies(load_cookie_items())
         page = context.new_page()
         try:
-            goods, total = collect(page, limit=limit)
+            goods, total = collect(
+                page,
+                limit=limit,
+                should_stop=cancel_event.is_set if cancel_event else None,
+                progress=progress,
+            )
+        except SearchCancelled as exc:
+            goods, total = exc.goods, exc.total
+            errors.append("已停止抓取")
         except RuntimeError as exc:
             errors.append(str(exc))
         finally:

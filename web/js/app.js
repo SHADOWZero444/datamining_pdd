@@ -14,7 +14,7 @@ const TAGS = [
 ];
 
 const state = {
-  section: "tools",
+  section: "home",
   toolLabel: "功能区概览",
   keywords: [],
   job: { running: false, status: "idle", message: "", keyword: "" },
@@ -25,6 +25,9 @@ const state = {
   multi: false,
   selected: [],
   goods: {},
+  metadata: {},
+  views: {},
+  auth: { running: false, status: "idle", message: "正在读取登录状态…", configured: false, cookie: "" },
   form: { keyword: "", priceMin: "", priceMax: "", banned: "", tags: [] },
 };
 
@@ -41,6 +44,52 @@ function money(value) {
   return String(value).startsWith("¥") ? value : `¥${value}`;
 }
 
+function numericValue(value) {
+  const text = String(value ?? "").replace(/,/g, "");
+  const match = text.match(/\d+(?:\.\d+)?/);
+  if (!match) return -1;
+  const number = Number(match[0]);
+  return text.includes("万") ? number * 10000 : number;
+}
+
+function viewOf(keyword) {
+  if (!state.views[keyword]) {
+    state.views[keyword] = { page: 1, pageSize: 100, startId: "", endId: "", sort: null };
+  }
+  return state.views[keyword];
+}
+
+function describeConditions(keyword) {
+  const metadata = state.metadata[keyword] || {};
+  const filters = metadata.filters || {};
+  const tags = (filters.tags || []).map(badgeText).join("、") || "无";
+  const low = filters.price_min;
+  const high = filters.price_max;
+  const price = low == null && high == null ? "无" : `${low == null ? "不限" : `¥${low}`} 至 ${high == null ? "不限" : `¥${high}`}`;
+  return `搜索词：${metadata.keyword || keyword}　标签：${tags}　价格区间：${price}　禁用词：${filters.banned || "无"}`;
+}
+
+function sortedAndRangedRows(keyword) {
+  const view = viewOf(keyword);
+  const rows = [...(state.goods[keyword] || [])];
+  const start = numericValue(view.startId);
+  const end = numericValue(view.endId);
+  let visible = rows.filter((item) => {
+    const seq = numericValue(item.seq);
+    return (start < 0 || seq >= start) && (end < 0 || seq <= end);
+  });
+  const sort = view.sort;
+  if (!sort) return visible.sort((a, b) => numericValue(a.seq) - numericValue(b.seq));
+  const field = sort.field;
+  const factor = sort.direction === "asc" ? 1 : -1;
+  return visible.sort((a, b) => {
+    const aValue = field === "title" || field === "shop_name" ? String(a[field] || "") : numericValue(a[field]);
+    const bValue = field === "title" || field === "shop_name" ? String(b[field] || "") : numericValue(b[field]);
+    if (typeof aValue === "string") return factor * aValue.localeCompare(bValue, "zh-CN");
+    return factor * (aValue - bValue);
+  });
+}
+
 function icon(name) {
   return `<img class="nav-ico" src="/icons/${name}" alt="">`;
 }
@@ -54,6 +103,8 @@ const ICONS = {
   group: icon("nav-group.png"),
   trash: icon("nav-trash.png"),
 };
+
+const EYE_ICON = `<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M2.5 12s3.4-5.5 9.5-5.5S21.5 12 21.5 12 18.1 17.5 12 17.5 2.5 12 2.5 12Z"></path><circle cx="12" cy="12" r="2.5"></circle></svg>`;
 
 function entryOf(keyword) {
   return state.library.entries.find((item) => item.keyword === keyword);
@@ -212,8 +263,20 @@ function searchForm() {
 
 function resultPage(keyword) {
   const rows = state.goods[keyword] || [];
+  const metadata = state.metadata[keyword] || {};
+  const view = viewOf(keyword);
+  const visibleRows = sortedAndRangedRows(keyword);
+  const pageCount = Math.max(1, Math.ceil(visibleRows.length / view.pageSize));
+  view.page = Math.min(Math.max(1, view.page), pageCount);
+  const pageRows = visibleRows.slice((view.page - 1) * view.pageSize, view.page * view.pageSize);
   const running = state.job.running && state.job.keyword === keyword;
-  const body = rows.length ? rows.map((item) => `
+  const sortHeader = (field, label) => {
+    const sort = view.sort;
+    const direction = sort?.field === field ? sort.direction : null;
+    const indicator = direction === "asc" ? "升序" : direction === "desc" ? "降序" : "未排序";
+    return `<th aria-sort="${direction === "asc" ? "ascending" : direction === "desc" ? "descending" : "none"}"><button class="table-sort" type="button" data-sort-keyword="${esc(keyword)}" data-sort-field="${field}">${label}<span aria-hidden="true" class="sort-mark ${direction || ""}"></span><span class="sr-only">${indicator}</span></button></th>`;
+  };
+  const body = pageRows.length ? pageRows.map((item) => `
     <tr data-open-goods="${esc(item.goods_id)}" data-keyword="${esc(keyword)}">
       <td class="seq">${esc(item.seq || "")}</td>
       <td>${item.image ? `<img class="thumb" src="${esc(item.image)}" alt="">` : '<span class="ph"></span>'}</td>
@@ -225,20 +288,30 @@ function resultPage(keyword) {
       <td class="price">${money(item.price)}</td>
       <td class="sales">${esc(item.sales || "—")}</td>
     </tr>
-  `).join("") : `<tr><td colspan="6"><p class="empty">${running ? "正在抓取，结果会陆续出现在这里。" : "还没有符合条件的商品。"}</p></td></tr>`;
+  `).join("") : `<tr><td colspan="6"><p class="empty">${running ? "正在抓取，结果会陆续出现在这里。" : rows.length ? "没有符合当前序号范围的商品。" : "还没有符合条件的商品。"}</p></td></tr>`;
   return `
     <div class="result-head">
       <div>
         <h1 class="page-title">${esc(entryOf(keyword)?.title || keyword)}</h1>
-        <p class="lede">搜索词条：${esc(keyword)}</p>
-        <p class="lede">${esc(state.job.keyword === keyword ? (state.job.message || `已保存 ${rows.length} 条`) : `已保存 ${rows.length} 条`)}</p>
-        <button class="ghost" type="button" data-delete-keyword="${esc(keyword)}">删除这个词条</button>
+        <p class="conditions">${esc(describeConditions(keyword))}</p>
+        <p class="storage-note">本次数据保存位置：<code>${esc(metadata.storage_path || `data/searches/${keyword}.jsonl`)}</code></p>
+        <p class="lede result-status">${esc(state.job.keyword === keyword ? (state.job.message || `已保存 ${rows.length} 条`) : `已保存 ${rows.length} 条`)}</p>
+        <div class="result-actions">
+          ${running ? '<button class="stop" type="button" data-stop-search>停止抓取</button>' : ""}
+          <button class="ghost" type="button" data-delete-keyword="${esc(keyword)}">删除这个词条</button>
+        </div>
       </div>
     </div>
+    <section class="table-controls" aria-label="数据列表显示方式">
+      <div class="control-group"><label for="page-size-${esc(keyword)}">每页显示</label><select id="page-size-${esc(keyword)}" data-page-size="${esc(keyword)}"><option value="50" ${view.pageSize === 50 ? "selected" : ""}>50 条</option><option value="100" ${view.pageSize === 100 ? "selected" : ""}>100 条</option><option value="200" ${view.pageSize === 200 ? "selected" : ""}>200 条</option><option value="500" ${view.pageSize === 500 ? "selected" : ""}>500 条</option></select></div>
+      <form class="range-filter" data-range-form="${esc(keyword)}"><label for="start-id-${esc(keyword)}">序号范围</label><input id="start-id-${esc(keyword)}" name="startId" type="number" min="1" placeholder="起始 ID" value="${esc(view.startId)}"><span>至</span><input name="endId" type="number" min="1" placeholder="结束 ID" value="${esc(view.endId)}"><button class="ghost" type="submit">应用</button><button class="text-btn" type="button" data-clear-range="${esc(keyword)}">清除</button></form>
+      <p class="table-count">显示 ${pageRows.length ? (view.page - 1) * view.pageSize + 1 : 0}–${Math.min(view.page * view.pageSize, visibleRows.length)} / ${visibleRows.length} 条${visibleRows.length !== rows.length ? `（共 ${rows.length} 条）` : ""}</p>
+    </section>
     <table class="catalog">
-      <thead><tr><th>ID</th><th>图片</th><th>商品</th><th>店名</th><th>价格</th><th>销量</th></tr></thead>
+      <thead><tr>${sortHeader("seq", "ID")}<th>图片</th>${sortHeader("title", "商品")}${sortHeader("shop_name", "店名")}${sortHeader("price", "价格")}${sortHeader("sales", "销量")}</tr></thead>
       <tbody>${body}</tbody>
-    </table>`;
+    </table>
+    <nav class="pagination" aria-label="商品列表翻页"><button class="ghost" type="button" data-page-step="prev" data-page-keyword="${esc(keyword)}" ${view.page === 1 ? "disabled" : ""}>上一页</button><span>第 ${view.page} / ${pageCount} 页</span><button class="ghost" type="button" data-page-step="next" data-page-keyword="${esc(keyword)}" ${view.page === pageCount ? "disabled" : ""}>下一页</button></nav>`;
 }
 
 function detailPage(tab) {
@@ -265,6 +338,19 @@ function detailPage(tab) {
 }
 
 function topPage() {
+  if (state.section === "home") {
+    const auth = state.auth;
+    return `<section class="login-page">
+      <div class="login-intro"><h1 class="page-title">登录拼多多</h1><p class="lede">导入自己的登录信息后，即可按条件抓取公开搜索结果。登录信息只保存在本机，不会上传到其他服务器。</p></div>
+      <form class="login-form" id="cookie-form">
+        <label class="field-label" for="cookie-input">Cookie 登录信息</label>
+        <div class="cookie-field"><input id="cookie-input" name="cookie" class="cookie-input" type="password" autocomplete="off" spellcheck="false" placeholder="粘贴 cookie，或点击“前往获取”后自动导入" value="${esc(auth.cookie || "")}"><button class="eye-btn" type="button" data-toggle-cookie aria-label="显示登录信息" aria-pressed="false">${EYE_ICON}</button></div>
+        <p class="help">请仅使用自己的账号。Cookie 是登录凭证，请勿发送给他人。</p>
+        <p class="auth-status ${auth.status === "failed" ? "error" : ""}" role="status">${esc(auth.message || (auth.configured ? "已设置登录信息。" : "尚未设置登录信息。"))}</p>
+        <div class="login-actions"><button class="start" type="submit">确认</button><button class="ghost" type="button" data-clear-cookie>清除</button><button class="ghost" type="button" data-login-cookie ${auth.running ? "disabled" : ""}>${auth.running ? "等待登录…" : "前往获取"}</button></div>
+      </form>
+    </section>`;
+  }
   if (state.section === "settings") {
     const theme = document.documentElement.dataset.theme || "day";
     const option = (value, label) => `<label><input type="radio" name="theme" value="${value}" ${theme === value ? "checked" : ""}>${label}</label>`;
@@ -297,6 +383,12 @@ function render() {
 async function loadGoods(keyword) {
   const data = await api(`/api/results?keyword=${encodeURIComponent(keyword)}`);
   state.goods[keyword] = data.goods || [];
+  state.metadata[keyword] = data.metadata || {};
+}
+
+async function loadCookie() {
+  const data = await api("/api/cookie");
+  state.auth = { ...state.auth, ...(data.auth || {}) };
 }
 
 async function openEntryMenu(anchor, keyword) {
@@ -366,6 +458,10 @@ async function refresh() {
   if (data.library) state.library = data.library;
   state.library = data.library || { groups: [], entries: (data.keywords || []).map((item) => ({ ...item, title: item.keyword, pinned: false, groupId: "" })) };
   state.job = data.job || state.job;
+  const wasWaitingForLogin = Boolean(state.auth.running);
+  const authChanged = JSON.stringify({ ...state.auth, cookie: undefined }) !== JSON.stringify({ ...(data.auth || {}), cookie: undefined });
+  state.auth = { ...state.auth, ...(data.auth || {}) };
+  if (wasWaitingForLogin && !state.auth.running && state.auth.status === "ok") await loadCookie();
   const tab = state.tabs.find((item) => item.id === state.active);
   let goodsChanged = false;
   if (tab && (tab.kind === "search" || tab.kind === "goods")) {
@@ -374,11 +470,11 @@ async function refresh() {
     goodsChanged = before !== JSON.stringify(state.goods[tab.keyword] || []);
   }
   const typing = ["keyword", "banned", "priceMin", "priceMax"].includes(document.activeElement?.name) || document.activeElement?.id === "keyword";
-  if (typing && !jobChanged && !goodsChanged) {
+  if (typing && !jobChanged && !goodsChanged && !authChanged) {
     if (keywordsChanged) renderNav();
     return;
   }
-  if (jobChanged || keywordsChanged || goodsChanged) render();
+  if (jobChanged || keywordsChanged || goodsChanged || authChanged) render();
 }
 
 document.body.addEventListener("click", async (event) => {
@@ -402,6 +498,68 @@ document.body.addEventListener("click", async (event) => {
     state.active = null;
     state.section = "tools";
     render();
+    return;
+  }
+  if (event.target.closest("[data-toggle-cookie]")) {
+    const input = $("cookie-input");
+    if (!input) return;
+    const wasHidden = input.type === "password";
+    input.type = wasHidden ? "text" : "password";
+    const button = event.target.closest("[data-toggle-cookie]");
+    button.setAttribute("aria-pressed", String(wasHidden));
+    button.setAttribute("aria-label", wasHidden ? "隐藏登录信息" : "显示登录信息");
+    return;
+  }
+  if (event.target.closest("[data-clear-cookie]")) {
+    try {
+      const data = await api("/api/cookie", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "clear" }) });
+      state.auth = data.auth || state.auth;
+    } catch (exc) {
+      state.auth = { ...state.auth, status: "failed", message: exc.message };
+    }
+    render();
+    return;
+  }
+  if (event.target.closest("[data-login-cookie]")) {
+    try {
+      const data = await api("/api/cookie", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "login" }) });
+      state.auth = { ...state.auth, ...(data.auth || {}) };
+    } catch (exc) {
+      state.auth = { ...state.auth, status: "failed", message: exc.message };
+    }
+    render();
+    return;
+  }
+  if (event.target.closest("[data-stop-search]")) {
+    try { await api("/api/search/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }); } catch (_) { /* 下一次轮询会显示状态 */ }
+    return;
+  }
+  const sortButton = event.target.closest("[data-sort-field]");
+  if (sortButton) {
+    const keyword = sortButton.dataset.sortKeyword;
+    const view = viewOf(keyword);
+    const field = sortButton.dataset.sortField;
+    if (view.sort?.field !== field) view.sort = { field, direction: "asc" };
+    else if (view.sort.direction === "asc") view.sort = { field, direction: "desc" };
+    else view.sort = null;
+    view.page = 1;
+    renderStage();
+    return;
+  }
+  const pageStep = event.target.closest("[data-page-step]");
+  if (pageStep) {
+    const view = viewOf(pageStep.dataset.pageKeyword);
+    view.page += pageStep.dataset.pageStep === "next" ? 1 : -1;
+    renderStage();
+    return;
+  }
+  const clearRange = event.target.closest("[data-clear-range]");
+  if (clearRange) {
+    const view = viewOf(clearRange.dataset.clearRange);
+    view.startId = "";
+    view.endId = "";
+    view.page = 1;
+    renderStage();
     return;
   }
   if (event.target.closest("[data-fold-keywords]")) {
@@ -477,9 +635,12 @@ document.body.addEventListener("click", async (event) => {
     const keyword = deleteKeyword.dataset.deleteKeyword;
     const ok = await askModal({ title: "删除词条", text: `删除「${keyword}」及其已保存商品？删除后不能恢复。`, confirmLabel: "删除词条" });
     if (!ok) return;
-    await api(`/api/results?keyword=${encodeURIComponent(keyword)}`, { method: "DELETE" });
+    const removed = await api(`/api/results?keyword=${encodeURIComponent(keyword)}`, { method: "DELETE" });
     delete state.goods[keyword];
+    delete state.metadata[keyword];
+    delete state.views[keyword];
     state.keywords = state.keywords.filter((item) => item.keyword !== keyword);
+    if (removed.library) state.library = removed.library;
     closeTab(`result:${keyword}`);
     return;
   }
@@ -510,6 +671,33 @@ document.body.addEventListener("click", async (event) => {
 });
 
 document.body.addEventListener("submit", async (event) => {
+  if (event.target.id === "cookie-form") {
+    event.preventDefault();
+    const cookie = String(new FormData(event.target).get("cookie") || "").trim();
+    try {
+      const data = await api("/api/cookie", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "save", cookie }) });
+      state.auth = data.auth || state.auth;
+    } catch (exc) {
+      state.auth = { ...state.auth, status: "failed", message: exc.message };
+    }
+    render();
+    return;
+  }
+  const rangeForm = event.target.closest("[data-range-form]");
+  if (rangeForm) {
+    event.preventDefault();
+    const keyword = rangeForm.dataset.rangeForm;
+    const values = new FormData(rangeForm);
+    const startId = String(values.get("startId") || "").trim();
+    const endId = String(values.get("endId") || "").trim();
+    if (startId && endId && Number(startId) > Number(endId)) return;
+    const view = viewOf(keyword);
+    view.startId = startId;
+    view.endId = endId;
+    view.page = 1;
+    renderStage();
+    return;
+  }
   if (event.target.id !== "search-form") return;
   event.preventDefault();
   const form = new FormData(event.target);
@@ -547,9 +735,18 @@ document.body.addEventListener("submit", async (event) => {
 });
 
 document.body.addEventListener("change", (event) => {
-  if (event.target.name !== "theme") return;
-  document.documentElement.dataset.theme = event.target.value;
-  localStorage.setItem("pdd-theme", event.target.value);
+  if (event.target.name === "theme") {
+    document.documentElement.dataset.theme = event.target.value;
+    localStorage.setItem("pdd-theme", event.target.value);
+    return;
+  }
+  const keyword = event.target.dataset.pageSize;
+  if (keyword) {
+    const view = viewOf(keyword);
+    view.pageSize = Number(event.target.value) || 100;
+    view.page = 1;
+    renderStage();
+  }
 });
 
 $("nav-toggle").addEventListener("click", () => {
@@ -670,6 +867,7 @@ bindTabDrag($("tabs-detail"));
 
 document.documentElement.dataset.theme = localStorage.getItem("pdd-theme") || "day";
 render();
+loadCookie().then(() => render()).catch(() => {});
 refresh().catch((exc) => {
   $("stage").innerHTML = `<p class="empty">${esc(exc.message)}</p>`;
 });

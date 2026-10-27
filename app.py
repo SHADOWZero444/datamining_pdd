@@ -37,6 +37,7 @@ job = {
     "total": None,
 }
 job_lock = threading.Lock()
+job_cancel = None
 
 
 def read_filters(payload):
@@ -65,6 +66,44 @@ def safe_name(keyword):
 
 def result_path(keyword):
     return DATA_DIR / f"{safe_name(keyword)}.jsonl"
+
+
+def metadata_path(keyword):
+    return DATA_DIR / f"{safe_name(keyword)}.meta.json"
+
+
+def storage_path(keyword):
+    """返回给界面显示的相对保存位置，避免泄露本机绝对目录。"""
+    return (Path("data") / "searches" / f"{safe_name(keyword)}.jsonl").as_posix()
+
+
+def search_metadata(keyword):
+    defaults = {
+        "keyword": keyword,
+        "filters": {"tags": [], "banned": "", "price_min": None, "price_max": None},
+        "storage_path": storage_path(keyword),
+    }
+    path = metadata_path(keyword)
+    if not path.exists():
+        return defaults
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return defaults
+    defaults["filters"].update(saved.get("filters") or {})
+    defaults["keyword"] = saved.get("keyword") or keyword
+    return defaults
+
+
+def save_search_metadata(keyword, filters):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "keyword": keyword,
+        "filters": filters,
+        "storage_path": storage_path(keyword),
+        "saved_at": int(time.time()),
+    }
+    metadata_path(keyword).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def read_jsonl(path):
@@ -113,6 +152,58 @@ def load_goods(keyword):
         from pdd_search import parse_goods
         return parse_goods(saved.read_text(encoding="utf-8", errors="replace"))
     return []
+
+
+def cookie_path():
+    return ROOT / "cookie.txt"
+
+
+def read_cookie():
+    path = cookie_path()
+    return path.read_text(encoding="utf-8").strip() if path.is_file() else ""
+
+
+def save_cookie(value):
+    text = str(value or "").strip()
+    if not text or "=" not in text:
+        raise RuntimeError("登录信息格式不正确，请粘贴完整的 cookie。")
+    cookie_path().write_text(text, encoding="utf-8")
+
+
+def clear_cookie():
+    path = cookie_path()
+    if path.exists():
+        path.unlink()
+
+
+auth = {"running": False, "status": "idle", "message": "尚未设置登录信息"}
+auth_lock = threading.Lock()
+
+
+def auth_state(include_cookie=False):
+    with auth_lock:
+        current = dict(auth)
+    value = read_cookie()
+    current["configured"] = bool(value)
+    if include_cookie:
+        current["cookie"] = value
+    return current
+
+
+def retrieve_login_cookie():
+    """打开用户主动发起的登录窗口，只读取本程序登录页产生的拼多多 cookie。"""
+    from pdd_search import open_login_and_capture_cookie
+
+    try:
+        with auth_lock:
+            auth.update({"running": True, "status": "waiting", "message": "登录窗口已打开，请完成登录。"})
+        value = open_login_and_capture_cookie()
+        save_cookie(value)
+        with auth_lock:
+            auth.update({"running": False, "status": "ok", "message": "登录信息已导入，可以开始抓取。"})
+    except Exception as exc:
+        with auth_lock:
+            auth.update({"running": False, "status": "failed", "message": str(exc) or "未能获取登录信息。"})
 
 
 LIBRARY_FILE = ROOT / "data" / "library.json"
@@ -196,10 +287,27 @@ def update_library(payload):
             path = result_path(keyword)
             if path.exists():
                 path.unlink()
+            meta = metadata_path(keyword)
+            if meta.exists():
+                meta.unlink()
     else:
         raise RuntimeError("无法处理这个操作。")
     save_library(library)
     return {"ok": True, "library": library_state()}
+
+
+def ensure_library_entry(keyword):
+    library = load_library()
+    if not any(item.get("keyword") == keyword for item in library["entries"]):
+        library["entries"].append({"keyword": keyword, "title": keyword, "pinned": False, "groupId": ""})
+        save_library(library)
+
+
+def remove_library_entries(keywords):
+    library = load_library()
+    removed = set(keywords)
+    library["entries"] = [item for item in library["entries"] if item.get("keyword") not in removed]
+    save_library(library)
 
 
 def list_keywords():
@@ -233,19 +341,36 @@ def merge_goods(keyword, new_rows):
     return rows
 
 
-def run_job(keyword, limit, filters):
+def run_job(keyword, limit, filters, cancel_event):
     from pdd_search import run_search
 
     try:
-        goods, total, errors = run_search(keyword, limit=limit, filters=filters)
+        def report_progress(message, count, total=None):
+            with job_lock:
+                if job.get("running"):
+                    job.update({"message": message, "count": count, "total": total})
+
+        goods, total, errors = run_search(
+            keyword,
+            limit=limit,
+            filters=filters,
+            cancel_event=cancel_event,
+            progress=report_progress,
+        )
         saved = merge_goods(keyword, goods) if goods else read_jsonl(result_path(keyword))
-        if goods:
+        stopped = cancel_event.is_set()
+        if stopped:
+            message = f"已停止抓取，已保留 {len(saved)} 条商品"
+            status = "stopped"
+        elif goods:
             message = f"本次新增或更新 {len(goods)} 条，库里共 {len(saved)} 条"
+            status = "ok" if not errors else "partial"
         elif saved:
             message = (errors[-1] + "。原来的数据还在。") if errors else "这次没有新商品，原来的数据还在。"
+            status = "partial"
         else:
             message = errors[-1] if errors else "没有抓到商品"
-        status = "ok" if goods and not errors else ("partial" if saved else "failed")
+            status = "failed"
         with job_lock:
             job.update({
                 "running": False,
@@ -276,11 +401,14 @@ class AppHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/state":
             with job_lock:
                 current = dict(job)
-            self.send_json({"keywords": list_keywords(), "library": library_state(), "job": current})
+            self.send_json({"keywords": list_keywords(), "library": library_state(), "job": current, "auth": auth_state()})
+            return
+        if parsed.path == "/api/cookie":
+            self.send_json({"auth": auth_state(include_cookie=True)})
             return
         if parsed.path == "/api/results":
             keyword = parse_qs(parsed.query).get("keyword", [""])[0]
-            self.send_json({"keyword": keyword, "goods": load_goods(keyword)})
+            self.send_json({"keyword": keyword, "goods": load_goods(keyword), "metadata": search_metadata(keyword)})
             return
         if parsed.path.startswith("/icons/"):
             self.serve_icon(parsed.path)
@@ -304,30 +432,61 @@ class AppHandler(SimpleHTTPRequestHandler):
             return
         if path.exists():
             path.unlink()
-        self.send_json({"ok": True, "count": 0})
+        meta = metadata_path(keyword)
+        if meta.exists():
+            meta.unlink()
+        remove_library_entries([keyword])
+        self.send_json({"ok": True, "count": 0, "library": library_state()})
 
     def do_POST(self):
+        global job_cancel
         path = urlparse(self.path).path
-        if path == "/api/library":
-            length = int(self.headers.get("Content-Length", "0"))
-            try:
-                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
-            except json.JSONDecodeError:
-                self.send_json({"ok": False, "message": "请求格式不对"}, 400)
-                return
-            try:
-                self.send_json(update_library(payload))
-            except RuntimeError as exc:
-                self.send_json({"ok": False, "message": str(exc)}, 400)
-            return
-        if urlparse(self.path).path != "/api/search":
-            self.send_error(404)
-            return
         length = int(self.headers.get("Content-Length", "0"))
         try:
             payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
         except json.JSONDecodeError:
             self.send_json({"ok": False, "message": "请求格式不对"}, 400)
+            return
+        if path == "/api/cookie":
+            action = payload.get("action")
+            try:
+                if action == "save":
+                    save_cookie(payload.get("cookie"))
+                    with auth_lock:
+                        auth.update({"running": False, "status": "ok", "message": "登录信息已保存，可以开始抓取。"})
+                elif action == "clear":
+                    clear_cookie()
+                    with auth_lock:
+                        auth.update({"running": False, "status": "idle", "message": "已清除本机保存的登录信息。"})
+                elif action == "login":
+                    with auth_lock:
+                        if auth["running"]:
+                            raise RuntimeError("登录窗口已经打开，请先完成登录。")
+                        auth.update({"running": True, "status": "starting", "message": "正在打开登录窗口…"})
+                    threading.Thread(target=retrieve_login_cookie, daemon=True).start()
+                else:
+                    raise RuntimeError("无法处理这个操作。")
+                self.send_json({"ok": True, "auth": auth_state(include_cookie=True)})
+            except RuntimeError as exc:
+                self.send_json({"ok": False, "message": str(exc)}, 400)
+            return
+        if path == "/api/search/stop":
+            with job_lock:
+                if not job["running"] or job_cancel is None:
+                    self.send_json({"ok": False, "message": "当前没有正在进行的抓取。"}, 409)
+                    return
+                job_cancel.set()
+                job["message"] = "正在停止，已读取的商品会保留。"
+            self.send_json({"ok": True})
+            return
+        if path == "/api/library":
+            try:
+                self.send_json(update_library(payload))
+            except RuntimeError as exc:
+                self.send_json({"ok": False, "message": str(exc)}, 400)
+            return
+        if path != "/api/search":
+            self.send_error(404)
             return
         keyword = str(payload.get("keyword") or "").strip()
         if not keyword:
@@ -354,7 +513,10 @@ class AppHandler(SimpleHTTPRequestHandler):
                 "count": 0,
                 "total": None,
             })
-        threading.Thread(target=run_job, args=(keyword, limit, filters), daemon=True).start()
+            job_cancel = threading.Event()
+        save_search_metadata(keyword, filters)
+        ensure_library_entry(keyword)
+        threading.Thread(target=run_job, args=(keyword, limit, filters, job_cancel), daemon=True).start()
         self.send_json({"ok": True, "keyword": keyword})
 
     def send_json(self, data, status=200):
