@@ -357,7 +357,7 @@ function topPage() {
         <label class="field-label" for="cookie-input">Cookie 登录信息</label>
         <div class="cookie-field"><input id="cookie-input" name="cookie" class="cookie-input" type="password" autocomplete="off" spellcheck="false" placeholder="粘贴 cookie，或点击“前往获取”后自动导入" value="${esc(auth.cookie || "")}"><button class="eye-btn" type="button" data-toggle-cookie aria-label="显示登录信息" aria-pressed="false">${EYE_ICON}</button></div>
         <p class="help">请仅使用自己的账号。Cookie 是登录凭证，请勿发送给他人。</p>
-        <p class="auth-status ${auth.status === "failed" ? "error" : ""}" role="status">${esc(auth.message || (auth.configured ? "已设置登录信息。" : "尚未设置登录信息。"))}</p>
+        <p class="auth-status ${auth.status === "failed" ? "error" : ""}" role="status">${esc(auth.message || (auth.configured ? "已设置登录信息。" : "尚未设置登录信息请点击确认以开始。"))}</p>
         <div class="login-actions"><button class="start" type="submit">确认</button><button class="ghost" type="button" data-clear-cookie>清除</button><button class="ghost" type="button" data-login-cookie ${auth.running ? "disabled" : ""}>${auth.running ? "等待登录…" : "前往获取"}</button></div>
       </form>
     </section>`;
