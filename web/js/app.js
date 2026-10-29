@@ -25,10 +25,11 @@ const state = {
   multi: false,
   selected: [],
   goods: {},
+  revisions: {},
   metadata: {},
   views: {},
   auth: { running: false, status: "idle", message: "正在读取登录状态…", configured: false, cookie: "" },
-  form: { keyword: "", priceMin: "", priceMax: "", banned: "", tags: [], limit: "300" },
+  form: { keyword: "", priceMin: "", priceMax: "", banned: "", tags: [], limit: "" },
 };
 
 const $ = (id) => document.getElementById(id);
@@ -280,9 +281,9 @@ function searchForm() {
         <p class="help">多个禁用词请用英文逗号 , 分隔。例如：二手,翻新</p>
       </div>
       <div class="scrape-limit">
-        <label class="field-label" for="scrape-limit">本次抓取数据限制</label>
-        <div class="limit-input"><input id="scrape-limit" name="limit" type="number" min="1" max="10000" step="1" inputmode="numeric" required value="${esc(state.form.limit)}"></div>
-        <p class="help">抓到指定条数后会自动停止。本次最多可设置 10000 条。</p>
+        <label class="field-label" for="scrape-limit">本次抓取上限（选填）</label>
+        <div class="limit-input"><input id="scrape-limit" name="limit" type="number" min="1" max="10000" step="1" inputmode="numeric" placeholder="不限" aria-describedby="limit-help" value="${esc(state.form.limit)}"></div>
+        <p class="help" id="limit-help">留空将持续抓取，直到你停止或页面没有更多结果。也可填写 1–10000，达到符合筛选条件的条数后停止。结果会边抓取边保存。</p>
       </div>
       <p class="error" id="form-error" role="alert"></p>
       <button class="start" type="submit" ${state.job.running ? "disabled" : ""}>${state.job.running ? "正在抓取" : "开始"}</button>
@@ -307,7 +308,7 @@ function resultPage(keyword) {
   const body = pageRows.length ? pageRows.map((item) => `
     <tr data-open-goods="${esc(item.goods_id)}" data-keyword="${esc(keyword)}">
       <td class="seq">${esc(item.seq || "")}</td>
-      <td>${item.image ? `<img class="thumb" src="${esc(item.image)}" alt="">` : '<span class="ph"></span>'}</td>
+      <td>${item.image ? `<img class="thumb" src="${esc(item.image)}" alt="" loading="lazy" decoding="async">` : '<span class="ph"></span>'}</td>
       <td>
         <p class="name">${esc(item.title || "未命名商品")}</p>
         <div class="badges">${(item.badges || []).map((id) => `<span>${esc(badgeText(id))}</span>`).join("")}</div>
@@ -323,10 +324,9 @@ function resultPage(keyword) {
         <h1 class="page-title">${esc(entryOf(keyword)?.title || keyword)}</h1>
         <p class="conditions">${esc(describeConditions(keyword))}</p>
         <p class="storage-note">本次数据保存位置：<code>${esc(metadata.storage_path || `data/searches/${keyword}.jsonl`)}</code></p>
-        <p class="lede result-status">${esc(state.job.keyword === keyword ? (state.job.message || `已保存 ${rows.length} 条`) : `已保存 ${rows.length} 条`)}</p>
+        <p class="lede result-status" role="status">${esc(state.job.keyword === keyword ? (state.job.message || `已保存 ${rows.length} 条`) : `已保存 ${rows.length} 条`)}</p>
         <div class="result-actions">
-          ${running ? '<button class="stop" type="button" data-stop-search>停止抓取</button>' : ""}
-          <button class="ghost" type="button" data-delete-keyword="${esc(keyword)}">删除这个词条</button>
+          <button class="ghost" type="button" data-delete-keyword="${esc(keyword)}" ${running ? 'disabled title="请先停止抓取"' : ''}>删除这个词条</button>
         </div>
       </div>
     </div>
@@ -339,10 +339,10 @@ function resultPage(keyword) {
       </form>
       <p class="table-count">显示 ${pageRows.length ? (view.page - 1) * view.pageSize + 1 : 0}–${Math.min(view.page * view.pageSize, visibleRows.length)} / ${visibleRows.length} 条${visibleRows.length !== rows.length ? `（共 ${rows.length} 条）` : ""}</p>
     </section>
-    <table class="catalog">
+    <div class="catalog-scroll" role="region" aria-label="商品列表，可横向滚动" tabindex="0"><table class="catalog">
       <thead><tr>${sortHeader("seq", "ID")}<th>图片</th>${sortHeader("title", "商品")}${sortHeader("shop_name", "店名")}${sortHeader("price", "价格")}${sortHeader("sales", "销量")}</tr></thead>
       <tbody>${body}</tbody>
-    </table>
+    </table></div>
     <nav class="pagination" aria-label="商品列表翻页"><button class="ghost" type="button" data-page-step="prev" data-page-keyword="${esc(keyword)}" ${view.page === 1 ? "disabled" : ""}>上一页</button><form class="page-jump" data-page-form="${esc(keyword)}"><label for="page-number-${esc(keyword)}">第</label><input id="page-number-${esc(keyword)}" name="page" type="number" min="1" max="${pageCount}" step="1" inputmode="numeric" value="${view.page}"><span>/ ${pageCount} 页</span><button class="ghost" type="submit">跳转</button></form><button class="ghost" type="button" data-page-step="next" data-page-keyword="${esc(keyword)}" ${view.page === pageCount ? "disabled" : ""}>下一页</button></nav>`;
 }
 
@@ -364,7 +364,7 @@ function detailPage(tab) {
           <dt>词条</dt><dd>${esc(tab.keyword)}</dd>
         </dl>
         <p><a href="${esc(item.url)}" target="_blank" rel="noreferrer">在拼多多打开</a></p>
-        <p><button class="ghost" type="button" data-delete-goods="${esc(item.goods_id)}" data-keyword="${esc(tab.keyword)}">删除这条</button></p>
+        <p><button class="ghost" type="button" data-delete-goods="${esc(item.goods_id)}" data-keyword="${esc(tab.keyword)}" ${state.job.running && state.job.keyword === tab.keyword ? 'disabled title="请先停止抓取"' : ''}>删除这条</button></p>
       </div>
     </article>`;
 }
@@ -394,28 +394,105 @@ function topPage() {
   return `<h1 class="page-title">${esc(TOP.find((item) => item.id === state.section)?.label || "")}</h1><p class="empty">这个页面还没做。请先使用功能区里的搜索词条爬取。</p>`;
 }
 
+const stagePositions = new Map();
+let renderedStageKey = null;
+
 function renderStage() {
-  if (state.section !== "tools") {
-    $("stage").innerHTML = topPage();
-    return;
+  const stage = $("stage");
+  // active 已经切换，用上次实际渲染的标识保存离开的页面。
+  if (renderedStageKey !== null) {
+    stagePositions.delete(renderedStageKey);
+    stagePositions.set(renderedStageKey, {
+      top: stage.scrollTop, left: stage.scrollLeft,
+      tableLeft: stage.querySelector(".catalog-scroll")?.scrollLeft || 0,
+    });
+    if (stagePositions.size > 100) stagePositions.delete(stagePositions.keys().next().value);
   }
   const tab = state.tabs.find((item) => item.id === state.active);
-  if (tab && tab.kind === "goods") $("stage").innerHTML = detailPage(tab);
-  else if (tab && tab.kind === "search") $("stage").innerHTML = resultPage(tab.keyword);
-  else if (state.toolLabel === "搜索词条爬取") $("stage").innerHTML = searchForm();
-  else $("stage").innerHTML = `<h1 class="page-title">功能区概览</h1>`;
+  if (state.section !== "tools") {
+    stage.innerHTML = topPage();
+  } else {
+    if (tab && tab.kind === "goods") stage.innerHTML = detailPage(tab);
+    else if (tab && tab.kind === "search") stage.innerHTML = resultPage(tab.keyword);
+    else if (state.toolLabel === "搜索词条爬取") stage.innerHTML = searchForm();
+    else stage.innerHTML = `<h1 class="page-title">功能区概览</h1>`;
+  }
+  const key = state.section !== "tools" ? state.section
+    : tab ? `${tab.id}:${tab.kind === "search" ? JSON.stringify(viewOf(tab.keyword)) : ""}`
+    : `tools:${state.toolLabel}`;
+  renderedStageKey = key;
+  const position = stagePositions.get(key);
+  stage.scrollTop = position?.top || 0;
+  stage.scrollLeft = position?.left || 0;
+  const table = stage.querySelector(".catalog-scroll");
+  if (table) table.scrollLeft = position?.tableLeft || 0;
 }
 
 function render() {
+  renderCaptureBar();
   renderNav();
   renderTabs();
   renderStage();
 }
 
 async function loadGoods(keyword) {
-  const data = await api(`/api/results?keyword=${encodeURIComponent(keyword)}`);
-  state.goods[keyword] = data.goods || [];
+  const revision = state.revisions[keyword] || "";
+  const data = await api(`/api/results?keyword=${encodeURIComponent(keyword)}&revision=${encodeURIComponent(revision)}`);
+  if (!data.unchanged) {
+    if (data.delta) {
+      const rows = new Map((state.goods[keyword] || []).map((row) => [row.goods_id, row]));
+      (data.removed || []).forEach((id) => rows.delete(id));
+      (data.goods || []).forEach((row) => rows.set(row.goods_id, row));
+      state.goods[keyword] = [...rows.values()];
+    } else state.goods[keyword] = data.goods || [];
+  }
+  state.revisions[keyword] = data.revision;
   state.metadata[keyword] = data.metadata || {};
+  return !data.unchanged;
+}
+
+function renderCaptureBar() {
+  const bar = $("capture-bar");
+  bar.hidden = !state.job.running;
+  if (capturePanel.isOpen && (!state.job.running || state.job.id !== capturePanel.jobId)) capturePanel.hide(false);
+  if (!state.job.running) return;
+  if (!bar.firstElementChild) bar.innerHTML = `<span class="capture-message" role="status"></span><div class="capture-actions"><button type="button" class="ghost" data-capture-results>查看结果</button><button type="button" class="ghost" data-capture-browser="open" hidden>查看抓取页面</button><button type="button" class="ghost" data-capture-browser="resume" hidden>继续抓取</button><button type="button" class="stop" data-stop-search>停止抓取</button></div>`;
+  const message = `${state.job.keyword}：${state.job.message || "正在抓取"}`;
+  if (bar.firstElementChild.textContent !== message) bar.firstElementChild.textContent = message;
+  const stop = bar.querySelector("[data-stop-search]");
+  stop.disabled = state.job.status === "stopping";
+  stop.textContent = stop.disabled ? "正在停止…" : "停止抓取";
+  const panelStop = $("capture-dialog").querySelector("[data-stop-search]");
+  panelStop.disabled = stop.disabled;
+  panelStop.textContent = stop.textContent;
+  const open = bar.querySelector('[data-capture-browser="open"]');
+  const resume = bar.querySelector('[data-capture-browser="resume"]');
+  const needsVerification = state.job.browser_available && state.job.status === "verification" && state.job.intervention_kind === "verification";
+  open.hidden = !needsVerification;
+  open.disabled = state.job.status === "stopping";
+  open.textContent = state.job.status === "verification" && state.job.intervention_kind !== "loading" ? "前往验证" : "查看抓取页面";
+  resume.hidden = !needsVerification;
+}
+
+function updateResultPage(keyword) {
+  // 不重建筛选表单；刷新表格时保留滚动位置、焦点和未提交的输入。
+  const stage = $("stage");
+  const template = document.createElement("template");
+  template.innerHTML = resultPage(keyword);
+  const scrollTop = stage.scrollTop;
+  for (const selector of [".result-status", ".result-actions", ".table-count", ".catalog tbody"]) {
+    const current = stage.querySelector(selector);
+    const next = template.content.querySelector(selector);
+    if (current && next && current.innerHTML !== next.innerHTML) {
+      // 正在选择或查看的行维持位置；新商品仍已进入本地数据，翻页即可查看。
+      if (selector === ".catalog tbody" && (current.contains(document.activeElement) || window.getSelection()?.toString())) continue;
+      current.innerHTML = next.innerHTML;
+    }
+  }
+  const pagination = stage.querySelector(".pagination");
+  const nextPagination = template.content.querySelector(".pagination");
+  if (pagination && !pagination.contains(document.activeElement) && pagination.innerHTML !== nextPagination.innerHTML) pagination.innerHTML = nextPagination.innerHTML;
+  stage.scrollTop = scrollTop;
 }
 
 async function loadCookie() {
@@ -521,10 +598,17 @@ async function removeKeywords(keywords) {
   state.multi = false;
 }
 
+let refreshing = false;
 async function refresh() {
+  if (refreshing) return;
+  refreshing = true;
+  try {
+  const active = state.active;
+  const section = state.section;
   const data = await api("/api/state");
   const jobChanged = JSON.stringify(data.job) !== JSON.stringify(state.job);
   const keywordsChanged = JSON.stringify(data.keywords) !== JSON.stringify(state.keywords);
+  const libraryChanged = JSON.stringify(data.library) !== JSON.stringify(state.library);
   state.keywords = data.keywords || [];
   if (data.library) state.library = data.library;
   state.library = data.library || { groups: [], entries: (data.keywords || []).map((item) => ({ ...item, title: item.keyword, pinned: false, groupId: "" })) };
@@ -536,19 +620,51 @@ async function refresh() {
   const tab = state.tabs.find((item) => item.id === state.active);
   let goodsChanged = false;
   if (tab && (tab.kind === "search" || tab.kind === "goods")) {
-    const before = JSON.stringify(state.goods[tab.keyword] || []);
-    await loadGoods(tab.keyword);
-    goodsChanged = before !== JSON.stringify(state.goods[tab.keyword] || []);
+    goodsChanged = await loadGoods(tab.keyword);
   }
-  const typing = ["keyword", "banned", "priceMin", "priceMax"].includes(document.activeElement?.name) || document.activeElement?.id === "keyword";
-  if (typing && !jobChanged && !goodsChanged && !authChanged) {
-    if (keywordsChanged) renderNav();
-    return;
+  renderCaptureBar();
+  if (keywordsChanged || libraryChanged) renderNav();
+  if (state.active !== active || state.section !== section) return;
+  if (tab?.kind === "search" && state.section === "tools" && (jobChanged || goodsChanged)) {
+    updateResultPage(tab.keyword);
+  } else if (tab?.kind === "goods" && state.section === "tools" && (goodsChanged || jobChanged)) {
+    if (!$("stage").contains(document.activeElement) && !window.getSelection()?.toString()) renderStage();
+  } else if (state.section === "home" && authChanged && !$("cookie-form")?.contains(document.activeElement)) {
+    renderStage();
   }
-  if (jobChanged || keywordsChanged || goodsChanged || authChanged) render();
+  const start = document.querySelector("#search-form .start");
+  if (start) { start.disabled = state.job.running; start.textContent = start.disabled ? "正在抓取" : "开始"; }
+  } finally { refreshing = false; }
 }
 
 document.body.addEventListener("click", async (event) => {
+  const browserAction = event.target.closest("[data-capture-browser]");
+  if (browserAction) {
+    browserAction.disabled = true;
+    try {
+      const action = browserAction.dataset.captureBrowser;
+      const jobId = state.job.id;
+      await api("/api/search/browser", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Capture-View": "1" },
+        body: JSON.stringify({ action, job_id: jobId }),
+      });
+      if (action === "open" && state.job.id === jobId) capturePanel.show(jobId);
+      if (action === "resume") capturePanel.hide(false);
+    } catch (exc) {
+      state.job.message = exc.message;
+    } finally {
+      browserAction.disabled = false;
+      renderCaptureBar();
+    }
+    return;
+  }
+  if (event.target.closest("[data-capture-results]")) {
+    const keyword = state.job.keyword;
+    await loadGoods(keyword);
+    openTab({ id: `result:${keyword}`, title: keyword, kind: "search", keyword });
+    return;
+  }
   const section = event.target.closest("[data-section]");
   if (section) {
     state.section = section.dataset.section;
@@ -602,7 +718,14 @@ document.body.addEventListener("click", async (event) => {
     return;
   }
   if (event.target.closest("[data-stop-search]")) {
-    try { await api("/api/search/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }); } catch (_) { /* 下一次轮询会显示状态 */ }
+    const button = event.target.closest("[data-stop-search]");
+    button.disabled = true;
+    try {
+      await api("/api/search/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+      state.job.status = "stopping";
+      state.job.message = "正在停止，已保存的商品会保留。";
+    } catch (exc) { state.job.message = exc.message; button.disabled = false; }
+    renderCaptureBar();
     return;
   }
   const sortButton = event.target.closest("[data-sort-field]");
@@ -710,6 +833,7 @@ document.body.addEventListener("click", async (event) => {
     if (!ok) return;
     const removed = await api(`/api/results?keyword=${encodeURIComponent(keyword)}`, { method: "DELETE" });
     delete state.goods[keyword];
+    delete state.revisions[keyword];
     delete state.metadata[keyword];
     delete state.views[keyword];
     state.keywords = state.keywords.filter((item) => item.keyword !== keyword);
@@ -798,8 +922,8 @@ document.body.addEventListener("submit", async (event) => {
     error.textContent = "请使用英文逗号 , 分隔禁用词。";
     return;
   }
-  if (!/^[1-9]\d*$/.test(limit) || Number(limit) > 10000) {
-    error.textContent = "本次抓取数据限制请填写 1 到 10000 之间的整数。";
+  if (limit && (!/^[1-9]\d*$/.test(limit) || Number(limit) > 10000)) {
+    error.textContent = "抓取上限请留空，或填写 1 到 10000 之间的整数。";
     return;
   }
   error.textContent = "";
@@ -809,6 +933,7 @@ document.body.addEventListener("submit", async (event) => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ keyword, limit, tags, banned, price_min: priceMin, price_max: priceMax }),
     });
+    state.job = { running: true, keyword, status: "running", message: "正在打开搜索页", count: 0 };
     if (!state.keywords.some((item) => item.keyword === keyword)) state.keywords.push({ keyword, count: 0 });
     openTab({ id: `result:${keyword}`, title: keyword, kind: "search", keyword });
   } catch (exc) {
@@ -946,4 +1071,13 @@ loadCookie().then(() => render()).catch(() => {});
 refresh().catch((exc) => {
   $("stage").innerHTML = `<p class="empty">${esc(exc.message)}</p>`;
 });
-setInterval(() => refresh().catch(() => {}), 2000);
+async function poll() {
+  try { await refresh(); }
+  catch (_) {
+    if (state.job.running) {
+      state.job.message = "暂时无法连接，正在重试；已显示的结果仍然保留。";
+      renderCaptureBar();
+    }
+  } finally { setTimeout(poll, 1000); }
+}
+setTimeout(poll, 1000);

@@ -18,11 +18,32 @@
         <div class="tab-row" id="tabs-main" role="tablist" aria-label="功能与词条"></div>
         <div class="tab-row tab-row-detail" id="tabs-detail" role="tablist" aria-label="商品详情" hidden></div>
       </div>
+      <div class="capture-bar" id="capture-bar" hidden></div>
       <main class="stage" id="stage"></main>
     </div>
   </div>
   <div id="context-menu" class="context-menu" role="menu" hidden></div>
   <div id="modal" class="modal" hidden></div>
+  <dialog id="capture-dialog" class="capture-dialog" aria-labelledby="capture-title" aria-describedby="capture-help">
+    <div class="capture-dialog-heading">
+      <h2 id="capture-title">抓取页面</h2>
+      <button type="button" class="ghost" id="capture-close" autofocus>关闭页面</button>
+    </div>
+    <p id="capture-help">在此点击或拖动完成验证。页面打开期间暂停自动翻页，关闭后继续；需要验证时会等待验证通过。</p>
+    <p id="capture-view-status" role="status">正在加载页面…</p>
+    <div class="capture-screen" id="capture-screen"></div>
+    <form id="capture-text-form" class="capture-text-form">
+      <label for="capture-text">输入文字</label>
+      <input id="capture-text" type="text" maxlength="500" autocomplete="off" placeholder="先点击页面中的输入框，再在这里输入">
+      <button class="ghost" type="submit">发送文字</button>
+      <button class="ghost" type="button" id="capture-tab">切换输入框</button>
+    </form>
+    <div class="capture-dialog-actions">
+      <button class="ghost" type="button" data-capture-browser="resume" id="capture-continue">继续抓取</button>
+      <button class="stop" type="button" data-stop-search>停止抓取</button>
+    </div>
+  </dialog>
+  <script src="js/capture-view.js"></script>
   <script src="js/app.js"></script>
 </body>
 </html>

@@ -6,6 +6,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from urllib.parse import quote, urljoin
 from urllib.request import urlopen
@@ -16,12 +17,15 @@ if _local_browsers.exists():
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(_local_browsers)
 
 from playwright.sync_api import sync_playwright
+from capture_browser import capture_session
+from capture_verification import handle_verification
 
 # 改这个词，就会搜这个词。
 SEARCH_VALUE = ""
-# 页面上的“1万+”不是接口真正返回的数量。翻页接口有自己的 total，到了就停。
-# 这是防止页面卡住时无限滚动的保险上限。
-SAFETY_LIMIT = 500
+# 用无进展超时防止无限等待，而不是截断正常加载的搜索结果。
+STALL_SECONDS = 60
+PAGE_RETRY_DELAYS = (15, 30, 60)
+MIN_PAGE_INTERVAL = 2.5
 BASE = "https://mobile.pinduoduo.com/"
 
 
@@ -119,54 +123,18 @@ def available_debug_port():
 
 
 def open_login_and_capture_cookie(timeout_seconds=600):
-    """用独立的真实浏览器窗口登录，只读取该窗口里的拼多多 cookie。"""
-    executable = normal_browser_executable()
-    if not executable:
-        raise RuntimeError("无法找到 Microsoft Edge 或 Chrome，请安装其中一个浏览器后重试。")
-    profile = program_dir() / "data" / "login-browser"
-    profile.mkdir(parents=True, exist_ok=True)
-    port = available_debug_port()
-    process = subprocess.Popen(
-        [
-            str(executable),
-            f"--remote-debugging-port={port}",
-            f"--user-data-dir={profile}",
-            "--new-window",
-            "https://mobile.pinduoduo.com/login.html",
-        ],
-        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
-    browser = None
-    try:
-        endpoint = f"http://127.0.0.1:{port}"
-        startup_deadline = time.monotonic() + 20
-        with sync_playwright() as browser_factory:
-            while time.monotonic() < startup_deadline:
-                try:
-                    urlopen(f"{endpoint}/json/version", timeout=1).close()
-                    browser = browser_factory.chromium.connect_over_cdp(endpoint)
-                    break
-                except Exception:
-                    if process.poll() is not None:
-                        raise RuntimeError("登录浏览器未能启动。")
-                    time.sleep(0.5)
-            if browser is None:
-                raise RuntimeError("登录浏览器启动超时，请重试。")
-            deadline = time.monotonic() + timeout_seconds
-            while time.monotonic() < deadline:
-                items = [
-                    item for context in browser.contexts for item in context.cookies()
-                    if str(item.get("domain") or "").lstrip(".").endswith("pinduoduo.com")
-                ]
-                if has_login_cookie(items):
-                    return cookie_header(items)
-                if process.poll() is not None:
-                    raise RuntimeError("登录窗口已关闭，尚未获取到登录信息。")
-                time.sleep(1)
-            raise RuntimeError("等待登录超时，请重新点击“前往获取”。")
-    finally:
-        if process.poll() is None:
-            process.terminate()
+    """登录使用抓取所用的持久会话，验证后的站点存储也会保留。"""
+    with capture_session(program_dir(), find_cookie_file(), headless=False) as page:
+        page.goto(BASE + "login.html", wait_until="domcontentloaded", timeout=30000)
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            items = page.context.cookies([BASE])
+            if has_login_cookie(items):
+                return cookie_header(items)
+            if page.is_closed():
+                raise RuntimeError("登录窗口已关闭，尚未获取到登录信息。")
+            page.wait_for_timeout(500)
+        raise RuntimeError("等待登录超时，请重新点击“前往获取”。")
 
 
 def read_js_string(block, key):
@@ -355,10 +323,8 @@ def read_dom_goods(page):
                 }
                 return null;
             }
-            const cards = [...document.querySelectorAll("div")].filter((node) => {
-                const text = node.innerText || "";
-                return text.includes("¥") && (text.includes("已拼") || text.includes("已抢")) && text.length < 280 && node.querySelector("img");
-            });
+            const cards = [...new Set([...document.querySelectorAll("img")]
+                .map((image) => image.parentElement).filter(Boolean))];
             const rows = [];
             const seen = new Set();
             cards.forEach((card) => {
@@ -432,110 +398,393 @@ def goods_from_api(data):
     return rows
 
 
-def wait_with_cancel(page, milliseconds, should_stop):
+def wait_with_cancel(page, milliseconds, should_stop, service=None):
     """把等待拆短，让“停止”不会被滚动间隔卡住。"""
     remaining = milliseconds
     while remaining > 0:
         if should_stop and should_stop():
             return False
+        if service:
+            service()
         step = min(200, remaining)
         page.wait_for_timeout(step)
         remaining -= step
     return True
 
 
-def collect(page, limit=None, should_stop=None, progress=None):
-    seen = {}
+def loading_error_retry_button(page):
+    """只处理现场确认的列表加载错误，不点击验证码中的刷新或重载整页。"""
+    try:
+        error = page.get_by_text("手机网络有问题，请检查网络", exact=False)
+        if error.count() != 1 or not error.is_visible():
+            return None
+        button = error.locator("..").get_by_text("刷新", exact=True)
+        if button.count() == 1 and button.is_visible():
+            return button
+    except Exception:
+        pass
+    return None
+
+
+def retry_delay(value, fallback):
+    """Retry-After 支持秒数和 HTTP 日期，不提前重试。"""
+    if value.isdigit():
+        return max(fallback, int(value))
+    try:
+        deadline = parsedate_to_datetime(value)
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=timezone.utc)
+        return max(fallback, (deadline - datetime.now(timezone.utc)).total_seconds())
+    except (ValueError, TypeError, OverflowError):
+        return fallback
+
+
+def scroll_results(page):
+    """连续滚动中的一段；接近底部减速，到底后不再发送滚轮事件。"""
+    target = page.evaluate("""() => {
+        const root = document.scrollingElement || document.documentElement;
+        const candidates = [...document.querySelectorAll('div, main, section')].filter(el => {
+            const style = getComputedStyle(el);
+            return /(auto|scroll)/.test(style.overflowY) && el.clientHeight > 200 &&
+                el.scrollHeight > el.clientHeight && el.getBoundingClientRect().width > 200 &&
+                el.getBoundingClientRect().bottom > 0 && el.getBoundingClientRect().top < innerHeight;
+        });
+        const el = candidates.sort((a, b) =>
+            b.querySelectorAll('img').length - a.querySelectorAll('img').length || b.clientHeight - a.clientHeight)[0] || root;
+        const rect = el === root ? {left:0, top:0, width:innerWidth, height:innerHeight} : el.getBoundingClientRect();
+        const remaining = Math.max(0, el.scrollHeight - el.clientHeight - el.scrollTop);
+        const viewport = Math.min(el.clientHeight, innerHeight);
+        const ratio = Math.min(1, remaining / Math.max(1, viewport * 2));
+        const ease = ratio * ratio * (3 - 2 * ratio);
+        const step = Math.min(remaining, Math.max(80, viewport * (.35 + .5 * ease)));
+        return {x:Math.max(1, Math.min(innerWidth-2, rect.left+rect.width/2)),
+                y:Math.max(1, Math.min(innerHeight-2, rect.top+Math.min(rect.height, innerHeight)/2)),
+                step, at_bottom:remaining <= 2, settle_ms:Math.round(260 - 120 * ease),
+                top:el.scrollTop, height:el.scrollHeight, viewport:el.clientHeight};
+    }""")
+    if not target["at_bottom"]:
+        page.mouse.move(target["x"], target["y"])
+        page.mouse.wheel(0, target["step"])
+    return target
+
+
+def page_state(page):
+    main_state = "loading"
+    for frame in page.frames:
+        try:
+            if frame != page.main_frame and not frame.frame_element().is_visible():
+                continue
+            state = frame.evaluate(r"""() => {
+                const text = document.body?.innerText || '';
+                if (/login\.html/.test(location.pathname) || /手机登录|请登录/.test(text)) return 'login';
+                if (/captcha|verify|verification/i.test(location.pathname) ||
+                    /请完成验证|安全验证|人机验证|拖动.{0,12}滑块|向右滑动|按住.{0,12}拖动|点击.{0,8}验证|验证后继续|Verify you are human|Just a moment/i.test(text)) return 'verification';
+                if (!document.body || !text.trim()) return 'loading';
+                if (/系统繁忙/.test(text) && /请稍后再试/.test(text)) return 'busy';
+                if (/访问过于频繁|操作过于频繁/.test(text)) return 'limited';
+                if (/没有更多商品|没有更多了|已显示全部结果/.test(text)) return 'end';
+                return '';
+            }""")
+            if state in ("verification", "login"):
+                return state
+            if frame == page.main_frame:
+                main_state = state
+            elif "challenges.cloudflare.com" in frame.url:
+                return "verification"
+        except Exception:
+            # 导航过程中 Frame 可能被替换，下次短轮询再次检查。
+            continue
+    return main_state
+
+
+def search_page_ready(page):
+    try:
+        return "search_result.html" in page.url and page.evaluate("""() =>
+            document.readyState !== 'loading' && !!document.body &&
+            (!!window.rawData?.stores || !!document.querySelector('img'))""")
+    except Exception:
+        return False
+
+
+def response_summary(data, response):
+    """只记录结构和已知错误代码，不记录凭证、验证令牌或原始正文。"""
+    summary = {"status": response.status, "content_type": response.headers.get("content-type", ""),
+               "body_type": type(data).__name__}
+    if isinstance(data, dict):
+        summary["keys"] = list(data)[:20]
+        summary["data_type"] = type(data.get("data")).__name__
+        for key in ("error_code", "code", "success"):
+            value = data.get(key)
+            if isinstance(value, (int, bool)):
+                summary[key] = value
+    return summary
+
+
+def collect(page, limit=None, should_stop=None, progress=None, filters=None,
+            on_batch=None, diagnostics=None, on_intervention=None, browser_request=None,
+            resume_request=None, capture_view=None):
+    """返回当前可访问的结果；只有明确的结束信号才称为完成。"""
+    stats = diagnostics if diagnostics is not None else {}
+    stats.update(scanned=0, matched=0, api_responses=0, unreadable_responses=0,
+                 rate_limits=0, http_errors={}, stop_reason="running", message="",
+                 response_samples=[], verification_count=0, scrolls=0, page_retries=0)
+    seen, accepted, pending = {}, {}, {}
     total = None
     blocked = []
+    exhausted = False
+    challenge_response = False
+    last_new = time.monotonic()
+    pending_requests = {}
+    last_request = float("-inf")
+    page_interval = MIN_PAGE_INTERVAL
 
-    def check_cancelled():
-        if should_stop and should_stop():
-            raise SearchCancelled(list(seen.values()), total)
+    def request_started(request):
+        nonlocal last_request
+        if is_search_api(request):
+            last_request = time.monotonic()
+            pending_requests[id(request)] = last_request
+
+    def request_finished(request):
+        nonlocal page_interval
+        started = pending_requests.pop(id(request), None)
+        if started is not None:
+            latency = time.monotonic() - started
+            floor = min(30, MIN_PAGE_INTERVAL * 2 ** stats["rate_limits"])
+            page_interval = min(30, max(floor, page_interval * .7 + latency * 1.5 * .3))
+            stats["page_interval_seconds"] = round(page_interval, 2)
+
+    def finish(reason, message):
+        stats.update(stop_reason=reason, message=message)
+
+    def report(message=None):
+        if progress:
+            progress(message or f"正在抓取，已读取 {len(seen)} 条，符合条件 {len(accepted)} 条",
+                     len(accepted), total)
+
+    def service_browser():
+        if browser_request and browser_request.is_set():
+            browser_request.clear()
+            if capture_view:
+                capture_view.open()
+        if capture_view:
+            capture_view.service(page, should_stop)
+
+    def resume_requested():
+        if resume_request and resume_request.is_set():
+            resume_request.clear()
+            return True
+        return False
+
+    def retry_page():
+        if stats["page_retries"] >= len(PAGE_RETRY_DELAYS):
+            return False
+        if capture_view and capture_view.opened.is_set():
+            return False
+        button = loading_error_retry_button(page)
+        if button is None:
+            return False
+        stats["page_retries"] += 1
+        try:
+            button.click(timeout=1500)
+        except Exception:
+            pass
+        return True
+
+    def intervene(kind, require_confirmation=False):
+        nonlocal last_new, exhausted, challenge_response
+        stats["verification_count"] += 1
+        # 进入等待后再接受新的“继续”指令，避免旧点击跳过本次处理。
+        if resume_request:
+            resume_request.clear()
+        result = handle_verification(
+            page, kind, check=lambda: page_state(page),
+            wait=lambda ms: wait_with_cancel(page, ms, should_stop),
+            notify=on_intervention, should_stop=should_stop, service=service_browser,
+            ready=lambda: search_page_ready(page), resume_requested=resume_requested,
+            require_confirmation=require_confirmation,
+        )
+        if result == "resumed":
+            if capture_view:
+                capture_view.close()
+            blocked.clear()
+            exhausted = False
+            challenge_response = False
+            last_new = time.monotonic()
+            # 验证弹层消失后，离开列表底部再向下，触发页面自身的下一页加载。
+            page.mouse.wheel(0, -120)
+            return True
+        finish("stopped" if result == "stopped" else "verification_timeout",
+               "已停止抓取" if result == "stopped" else "等待验证超时，已保留结果，请重新开始")
+        return False
+
+    def absorb_rows(rows):
+        nonlocal last_new
+        for row in rows:
+            key = row.get("goods_id")
+            if not key:
+                continue
+            if key not in seen:
+                last_new = time.monotonic()
+            # DOM 中缺失的字段不覆盖接口已提供的标签等信息。
+            previous = seen.get(key, {})
+            row = {**previous, **{k: v for k, v in row.items() if v not in (None, "", [])}}
+            seen[key] = row
+            if not apply_filters([row], filters):
+                continue
+            if key not in accepted and limit is not None and len(accepted) >= limit:
+                continue
+            if accepted.get(key) != row:
+                accepted[key] = row
+                pending[key] = dict(row)
+        stats.update(scanned=len(seen), matched=len(accepted))
+
+    def flush():
+        if pending and on_batch:
+            on_batch(list(pending.values()))
+        pending.clear()
 
     def on_response(response):
-        nonlocal total
+        nonlocal total, exhausted, challenge_response
         if not is_search_api(response):
             return
+        stats["api_responses"] += 1
         if response.status != 200:
-            blocked.append(response.status)
+            code = str(response.status)
+            stats["http_errors"][code] = stats["http_errors"].get(code, 0) + 1
+            blocked.append((response.status, response.headers.get("retry-after", "")))
             return
         try:
             data = response.json()
+            stats["response_samples"] = (stats["response_samples"] + [response_summary(data, response)])[-3:]
+            if not isinstance(data, dict):
+                raise ValueError("not an object")
+            data = data.get("data") if isinstance(data.get("data"), dict) else data
+            message = " ".join(str(data.get(key) or "") for key in ("error_msg", "error_message", "message"))
+            if re.search(r"验证|captcha|verification", message, re.I):
+                challenge_response = True
+            if str(data.get("total", "")).isdigit():
+                total = int(data["total"])
+            # total 仅是参考值，不作为抓取上限。
+            if data.get("has_more") is False or data.get("hasMore") is False:
+                exhausted = True
+            rows = goods_from_api(data)
+            if not rows and "items" not in data:
+                stats["unreadable_responses"] += 1
+            absorb_rows(rows)
         except Exception:
-            return
-        if data.get("total"):
-            total = int(data["total"])
-        for row in goods_from_api(data):
-            seen[row["goods_id"]] = row
+            # 响应体可能已失效或并非 JSON；继续从浏览器已渲染的卡片读取。
+            stats["unreadable_responses"] += 1
 
     page.on("response", on_response)
-    check_cancelled()
-    if progress:
-        progress("正在打开搜索页…", 0, None)
-    page.goto(search_url(SEARCH_VALUE), wait_until="domcontentloaded", timeout=30000)
+    page.on("request", request_started)
+    page.on("requestfinished", request_finished)
+    page.on("requestfailed", request_finished)
     try:
-        page.wait_for_function(
-            """() => {
-                const text = document.body ? document.body.innerText : "";
-                return !!(window.rawData && window.rawData.stores) || text.includes("已拼") || text.includes("已抢");
-            }""",
-            timeout=20000,
-        )
-    except Exception:
-        pass
-    if page_needs_login(page):
-        raise RuntimeError(
-            "登录已失效。请重新登录拼多多，把新的 cookie.txt 放到软件同一文件夹里。"
-        )
-
-    def absorb():
-        if page.evaluate("() => !!(window.rawData && window.rawData.stores)"):
-            for item in read_live_goods(page):
-                seen[item["goods_id"]] = item
-        for item in read_dom_goods(page):
-            seen[item["goods_id"]] = item
-
-    absorb()
-    if progress:
-        progress(f"正在抓取，已读取 {len(seen)} 条", len(seen), total)
-    if not seen:
-        title = page.title()
-        raise RuntimeError(f"没有读到商品。当前页面是：{title}")
-    # 连续几次滚完都没有新商品，才认为到底了。滚一次没反应就停，会把后面的页丢掉。
-    stalls = 0
-    cap = limit if limit else SAFETY_LIMIT
-    while len(seen) < cap:
-        check_cancelled()
-        if total and len(seen) >= total:
-            break
-        before = len(seen)
-        page.mouse.move(180, 520)
-        page.mouse.wheel(0, 6000)
-        page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
-        if not wait_with_cancel(page, 1600, should_stop):
-            check_cancelled()
-        absorb()
-        if len(seen) == before:
-            stalls += 1
-            if blocked and blocked[-1] == 429:
-                print("翻页被限速，等 15 秒再继续")
+        if should_stop and should_stop():
+            finish("stopped", "已停止抓取")
+            return [], None
+        report("正在打开搜索页…")
+        # commit 后以短等待读取页面，让首批数据和停止操作不必等待整个页面加载。
+        page.goto(search_url(SEARCH_VALUE), wait_until="commit", timeout=15000)
+        while True:
+            service_browser()
+            if should_stop and should_stop():
+                finish("stopped", "已停止抓取")
+                break
+            if capture_view and capture_view.opened.is_set():
+                # 用户接管时暂停自动滚动，避免验证控件或阅读位置移动。
+                # 验证等待循环自身也会服务页面，不需要另一个浏览器或线程。
+                if resume_requested():
+                    capture_view.close()
+                last_new = time.monotonic()
+                wait_with_cancel(page, 200, should_stop)
+                continue
+            absorb_rows(read_live_goods(page))
+            absorb_rows(read_dom_goods(page))
+            flush()
+            report()
+            if limit is not None and len(accepted) >= limit:
+                finish("limit", f"已达到本次上限 {limit} 条")
+                break
+            state = page_state(page)
+            if state in ("login", "verification") or challenge_response:
+                flush()
+                if on_intervention and state != "login":
+                    if intervene(state if state in ("login", "verification") else "verification",
+                                 require_confirmation=challenge_response and state not in ("login", "verification")):
+                        continue
+                    break
+            if state == "login":
+                finish("login", "登录已失效，请在主界面重新获取登录信息后重试")
+                break
+            if state == "verification":
+                finish("verification", "网站要求验证，请在浏览器完成验证后重试")
+                break
+            if state == "busy":
+                finish("site_busy", "网站提示系统繁忙，请稍后再试；已保存的商品仍会保留")
+                break
+            if state == "limited":
+                finish("rate_limited", "网站提示访问频繁，已停止抓取，请稍后再试；已保存的商品仍会保留")
+                break
+            if blocked:
+                events = list(blocked)
                 blocked.clear()
-                time.sleep(15)
-        else:
-            stalls = 0
-            print(f"已收集 {len(seen)} 条" + (f" / {total}" if total else ""))
-        if progress:
-            progress(f"正在抓取，已读取 {len(seen)} 条", len(seen), total)
-        if stalls >= 4:
-            break
-        if not wait_with_cancel(page, 1500, should_stop):
-            check_cancelled()
-    if blocked:
-        print(f"翻页接口被拒绝 {len(blocked)} 次，状态码 {blocked[-1]}")
-    if total and len(seen) < total:
-        print(f"接口显示最多 {total} 条，这次拿到 {len(seen)} 条")
-    return list(seen.values()), total
+                if any(code in (401, 403) for code, _ in events):
+                    finish("blocked", "网站拒绝了后续访问，请检查登录状态或稍后再试")
+                    break
+                limited = next((retry for code, retry in events if code == 429), None)
+                if limited is not None:
+                    stats["rate_limits"] += 1
+                    page_interval = min(30, page_interval * 2)
+                    if stats["rate_limits"] > 3:
+                        finish("rate_limited", "网站持续限速，已停止抓取，请稍后再试")
+                        break
+                    delay = retry_delay(limited, 15 * 2 ** (stats["rate_limits"] - 1))
+                    if delay > 120:
+                        finish("rate_limited", "网站要求较长等待，已停止抓取，请稍后再试")
+                        break
+                    report(f"网站暂时限速，等待 {delay:.0f} 秒后继续；可随时停止")
+                    if not wait_with_cancel(page, delay * 1000, should_stop, service_browser):
+                        continue
+                    # 站点限速后可能停留在错误卡片；等待结束后用原页面的刷新按钮续载。
+                    retry_page()
+                    last_new = time.monotonic()
+                    continue
+            if exhausted or state == "end":
+                finish("end", "当前搜索页已没有更多结果")
+                break
+            if time.monotonic() - last_new >= STALL_SECONDS:
+                if stats["page_retries"] < len(PAGE_RETRY_DELAYS) and loading_error_retry_button(page) is not None:
+                    delay = PAGE_RETRY_DELAYS[stats["page_retries"]]
+                    report(f"页面提示网络异常，等待 {delay} 秒后重试；可随时停止")
+                    if not wait_with_cancel(page, delay * 1000, should_stop, service_browser):
+                        continue
+                    retry_page()
+                    last_new = time.monotonic()
+                    continue
+                finish("stalled", "页面持续未加载新商品，已保留结果；可稍后重试。这不代表全部抓取完成")
+                break
+            # 请求未结束时只读取和等待；响应回来后保留最小间隔，避免快速连续翻页。
+            if pending_requests or time.monotonic() - last_request < page_interval:
+                wait_with_cancel(page, 200, should_stop)
+                continue
+            stats["last_scroll"] = scroll_results(page)
+            stats["scrolls"] += 1
+            position = stats["last_scroll"] or {}
+            wait_with_cancel(page, 500 if position.get("at_bottom") else position.get("settle_ms", 200), should_stop)
+            absorb_rows(read_dom_goods(page))
+            flush()
+    except Exception as exc:
+        finish("error", "页面读取中断，已保留此前结果，请重试")
+        stats["error_type"] = type(exc).__name__
+    finally:
+        page.remove_listener("response", on_response)
+        page.remove_listener("request", request_started)
+        page.remove_listener("requestfinished", request_finished)
+        page.remove_listener("requestfailed", request_finished)
+        flush()
+        stats["api_total"] = total
+    return list(accepted.values()), total
 
 
 def write_output(goods, errors, total):
@@ -596,42 +845,47 @@ def main():
     print(f"共 {len(goods)} 条，已写入 {OUTPUT_FILE.name}")
 
 
-def run_search(keyword, limit=None, filters=None, cancel_event=None, progress=None):
+def run_search(keyword, limit=None, filters=None, cancel_event=None, progress=None,
+               on_batch=None, diagnostics=None, on_intervention=None, browser_request=None,
+               resume_request=None, on_browser_ready=None, capture_view=None):
     """给界面调用。keyword 是搜索词，limit 是这次最多收多少条。"""
     global SEARCH_VALUE
     SEARCH_VALUE = (keyword or "").strip()
     if not SEARCH_VALUE:
         raise RuntimeError("搜索词不能为空")
     errors = []
+    diagnostics = diagnostics if diagnostics is not None else {}
     goods = []
     total = None
-    with sync_playwright() as browser_factory:
-        browser = launch_browser(browser_factory)
-        context = browser.new_context(
-            user_agent=PHONE_UA,
-            viewport={"width": 390, "height": 844},
-            locale="zh-CN",
-        )
-        context.add_cookies(load_cookie_items())
-        page = context.new_page()
-        try:
+    try:
+        with capture_session(program_dir(), find_cookie_file(),
+                             cancel_event.is_set if cancel_event else None) as page:
+            if on_browser_ready:
+                on_browser_ready(True)
             goods, total = collect(
                 page,
                 limit=limit,
                 should_stop=cancel_event.is_set if cancel_event else None,
                 progress=progress,
+                filters=filters,
+                on_batch=on_batch,
+                diagnostics=diagnostics,
+                on_intervention=on_intervention,
+                browser_request=browser_request,
+                resume_request=resume_request,
+                capture_view=capture_view,
             )
-        except SearchCancelled as exc:
-            goods, total = exc.goods, exc.total
-            errors.append("已停止抓取")
-        except RuntimeError as exc:
-            errors.append(str(exc))
-        finally:
-            browser.close()
-    before = len(goods)
-    goods = apply_filters(goods, filters)
-    if before and not goods:
-        errors.append("抓到了商品，但没有一条符合筛选条件")
+    except RuntimeError as exc:
+        errors.append(str(exc))
+    finally:
+        if capture_view:
+            capture_view.close()
+        if on_browser_ready:
+            on_browser_ready(False)
+    if diagnostics.get("stop_reason") not in (None, "end", "limit", "stopped"):
+        errors.append(diagnostics["message"])
+    if not goods and diagnostics.get("scanned") and not errors:
+        errors.append(f"已读取 {diagnostics['scanned']} 条商品，但没有符合筛选条件的结果")
     return goods, total, errors
 
 
