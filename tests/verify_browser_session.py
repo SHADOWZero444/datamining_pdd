@@ -4,8 +4,8 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from capture_browser import capture_session
-from capture_view import CaptureView
+from pdd.browser.session import capture_session
+from pdd.browser.view import CaptureView
 
 
 def main():

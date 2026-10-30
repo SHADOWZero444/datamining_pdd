@@ -1,0 +1,21 @@
+.settings-page { max-width: 760px; }
+.settings-header { margin-bottom: 28px; }
+.settings-header .lede { margin-bottom: 10px; }
+.settings-status { margin: 0; color: var(--ok); font-size: 13px; min-height: 20px; }
+.settings-status.error { color: var(--danger); }
+.settings-group { margin-bottom: 36px; }
+.settings-group h2 { font-size: 18px; margin: 0; padding-bottom: 12px; border-bottom: 2px solid var(--ink); scroll-margin-top: 12px; }
+.setting-row { display: flex; gap: 24px; align-items: center; justify-content: space-between; padding: 18px 0; border-bottom: 1px solid var(--line); }
+.setting-copy { flex: 1; min-width: 0; }
+.setting-copy > label, .setting-copy h3 { display: block; font-weight: 600; font-size: 14px; margin: 0; line-height: 1.5; }
+.setting-copy p, .settings-reset p { margin: 5px 0 0; color: var(--muted); font-size: 13px; line-height: 1.7; overflow-wrap: anywhere; }
+.setting-control { flex: 0 0 190px; display: flex; justify-content: flex-end; }
+.setting-control select { width: 100%; min-height: 40px; border: 1px solid var(--muted); border-radius: 4px; padding: 8px; background: var(--paper); color: var(--ink); font: inherit; font-size: 14px; }
+.settings-reset { margin-top: 24px; }
+.settings-reset summary { cursor: pointer; min-height: 40px; padding: 10px 0; font-size: 14px; }
+.settings-reset button { margin-top: 12px; }
+@media (max-width: 600px) {
+  .setting-row { align-items: stretch; flex-direction: column; gap: 12px; }
+  .setting-control { flex-basis: auto; justify-content: flex-start; }
+  .setting-row > button { align-self: flex-start; min-height: 40px; }
+}

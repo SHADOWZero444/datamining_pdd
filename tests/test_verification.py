@@ -3,8 +3,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch, Mock
 
-import capture_verification as verification
-from capture_browser import import_cookies
+import pdd.browser.verification as verification
+from pdd.browser.session import import_cookies
 
 
 class VerificationTests(unittest.TestCase):
@@ -68,7 +68,7 @@ class VerificationTests(unittest.TestCase):
     def test_explicit_import_does_not_overwrite_fresh_browser_cookies(self):
         import tempfile
         from pathlib import Path
-        from capture_browser import fingerprint
+        from pdd.browser.session import fingerprint
         with tempfile.TemporaryDirectory() as temp:
             cookie_file, marker = Path(temp) / "cookie.txt", Path(temp) / "hash"
             cookie_file.write_text("demo=old", encoding="utf-8")

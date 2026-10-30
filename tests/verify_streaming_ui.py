@@ -1,3 +1,4 @@
+from support import wait_for_state
 """用临时数据和独立端口验证实时界面；所有浏览器网络请求限定本机。"""
 import json
 import sys
@@ -8,8 +9,11 @@ from http.server import ThreadingHTTPServer
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import app
-import pdd_search as scraper
+from pdd.server import http as app
+from pdd.storage import results, library
+from pdd.services import auth as auth_service, jobs
+from pdd.scraping import filters as filter_tools, service
+from pdd.scraping import collector as scraper
 from playwright.sync_api import sync_playwright
 
 
@@ -61,25 +65,26 @@ def verify_collector(browser):
 
 
 def main():
-    output = Path(__file__).resolve().parents[1] / ".artifacts"
+    from support import artifact_dir
+    output = artifact_dir()
     output.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory() as temp, \
-         patch.object(app, "ROOT", Path(temp)), \
-         patch.object(app, "DATA_DIR", Path(temp) / "searches"), \
-         patch.object(app, "LIBRARY_FILE", Path(temp) / "library.json"):
-        app.result_feeds.clear()
+         patch.object(auth_service, "ROOT", Path(temp)), \
+         patch.object(results, "DATA_DIR", Path(temp) / "searches"), \
+         patch.object(library, "LIBRARY_FILE", Path(temp) / "library.json"):
+        results.result_feeds.clear()
         keyword = "蓝牙耳机"
         rows = [{"goods_id": str(i), "seq": i, "keyword": keyword,
                  "title": f"无线蓝牙耳机 · 长续航款 {i}", "price": str(39 + i % 100),
                  "sales": "已拼1000件"} for i in range(1, 20001)]
-        app.write_jsonl(app.result_path(keyword), rows)
-        app.ensure_library_entry(keyword)
-        app.job.update(running=True, keyword=keyword, status="running", id="ui-fixture", browser_available=True,
+        results.write_jsonl(results.result_path(keyword), rows)
+        library.ensure_library_entry(keyword)
+        jobs.job.update(running=True, keyword=keyword, status="running", id="ui-fixture", browser_available=True,
                        message="正在抓取，已读取 20000 条，符合条件 20000 条")
-        app.job_cancel = threading.Event()
-        app.job_browser_request = threading.Event()
-        app.job_resume_request = threading.Event()
-        app.job_capture_view = app.CaptureView()
+        jobs.job_cancel = threading.Event()
+        jobs.job_browser_request = threading.Event()
+        jobs.job_resume_request = threading.Event()
+        jobs.job_capture_view = app.CaptureView()
         server = ThreadingHTTPServer(("127.0.0.1", 0), app.AppHandler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         origin = f"http://127.0.0.1:{server.server_port}"
@@ -91,13 +96,13 @@ def main():
                 errors = []
                 page.on("pageerror", lambda error: errors.append(str(error)))
                 page.goto(origin)
-                page.wait_for_function("state.job.running")
+                wait_for_state(page, "state.job.running")
                 assert page.locator('[data-capture-browser="open"]').is_hidden()
                 for status, kind in (("recovering", "verification"), ("verification", "loading")):
-                    app.job.update(status=status, intervention_kind=kind)
+                    jobs.job.update(status=status, intervention_kind=kind)
                     page.evaluate("refresh()")
                     assert page.locator('[data-capture-browser="open"]').is_hidden()
-                app.job.update(status="running", intervention_kind=None)
+                jobs.job.update(status="running", intervention_kind=None)
                 page.get_by_role("button", name="查看结果", exact=True).click()
                 page.wait_for_selector(".catalog tbody tr")
                 assert page.locator(".catalog tbody tr").count() == 100
@@ -108,10 +113,10 @@ def main():
                 old_scroll = page.evaluate("document.querySelector('#stage').scrollTop")
                 page.evaluate("window.savedRow = document.querySelector('.catalog tbody tr')")
                 revision = page.evaluate("state.revisions['蓝牙耳机']")
-                app.merge_goods(keyword, [{"goods_id": "20001", "keyword": keyword, "title": "新增商品", "price": "55"}])
-                delta = app.result_feed(keyword, revision)
-                full = app.result_feed(keyword)
-                page.wait_for_function("state.goods['蓝牙耳机'].length === 20001")
+                results.merge_goods(keyword, [{"goods_id": "20001", "keyword": keyword, "title": "新增商品", "price": "55"}])
+                delta = results.result_feed(keyword, revision)
+                full = results.result_feed(keyword)
+                wait_for_state(page, "state.goods['蓝牙耳机'].length === 20001")
                 assert page.locator('input[name="startId"]').input_value() == "37"
                 assert page.locator('input[name="startId"]').evaluate("el => el === document.activeElement")
                 assert page.evaluate("window.savedRow === document.querySelector('.catalog tbody tr')")
@@ -126,8 +131,8 @@ def main():
                 saved = page.evaluate("[...stagePositions.values()].at(-1).top")
                 assert saved > 500, saved
                 assert page.evaluate("state.tabs.find(t => t.id === state.active).kind") == "goods"
-                app.merge_goods(keyword, [{"goods_id": "20002", "keyword": keyword, "title": "详情期间新增", "price": "56"}])
-                page.wait_for_function("state.goods['蓝牙耳机'].length === 20002")
+                results.merge_goods(keyword, [{"goods_id": "20002", "keyword": keyword, "title": "详情期间新增", "price": "56"}])
+                wait_for_state(page, "state.goods['蓝牙耳机'].length === 20002")
                 page.locator('#tabs-detail [data-close]').last.click()
                 assert page.locator('input[name="page"]').input_value() == "2"
                 assert page.evaluate("document.querySelector('#stage').scrollTop") == saved
@@ -142,27 +147,27 @@ def main():
                 assert page.evaluate("document.querySelector('.catalog-scroll').scrollLeft") == position['left']
                 page.set_viewport_size({"width": 1280, "height": 850})
                 page.evaluate("document.querySelector('#stage').scrollTop=0")
-                app.job.update(status="verification", intervention_kind="verification",
+                jobs.job.update(status="verification", intervention_kind="verification",
                                message="请点击“前往验证”，在抓取窗口完成验证；完成后会自动继续")
                 page.get_by_role("button", name="前往验证", exact=True).wait_for()
                 with page.expect_response(lambda response: response.url.endswith("/api/search/browser")) as opened:
                     page.get_by_role("button", name="前往验证", exact=True).click()
                 assert opened.value.status == 200
-                assert app.job_capture_view.opened.is_set()
+                assert jobs.job_capture_view.opened.is_set()
                 page.locator('#capture-dialog').wait_for(state='visible')
                 remote = browser.new_page(viewport={"width": 1000, "height": 760})
                 remote.route("**/*", lambda route: route.abort())
                 remote.set_content('''<meta charset=utf-8><body style="font:24px sans-serif;padding:40px">
                     <h2>本地验证交互样本</h2><p>点击按钮后返回原抓取任务。</p>
                     <button style="font:24px sans-serif;padding:20px" onclick="this.textContent='已完成'">完成样本操作</button></body>''')
-                app.job_capture_view.service(remote)
+                jobs.job_capture_view.service(remote)
                 page.locator('#capture-image').wait_for(state='visible')
                 remote_box = remote.locator('button').bounding_box()
                 image_box = page.locator('#capture-image').bounding_box()
                 with page.expect_response(lambda response: response.url.endswith('/api/search/browser')):
                     page.mouse.click(image_box['x'] + (remote_box['x'] + 30) / 1000 * image_box['width'],
                                      image_box['y'] + (remote_box['y'] + 20) / 760 * image_box['height'])
-                app.job_capture_view.service(remote)
+                jobs.job_capture_view.service(remote)
                 assert remote.locator('button').inner_text() == '已完成'
                 page.screenshot(path=str(output / "capture-panel-desktop.png"))
                 page.set_viewport_size({"width": 390, "height": 844})
@@ -172,21 +177,21 @@ def main():
                 with page.expect_response(lambda response: response.url.endswith("/api/search/browser")) as resumed:
                     page.locator('#capture-continue').click()
                 assert resumed.value.status == 200
-                assert app.job_resume_request.is_set()
-                assert not app.job_capture_view.opened.is_set()
+                assert jobs.job_resume_request.is_set()
+                assert not jobs.job_capture_view.opened.is_set()
                 remote.close()
                 page.locator('#capture-dialog').wait_for(state='hidden')
-                app.job.update(status='running', intervention_kind=None)
+                jobs.job.update(status='running', intervention_kind=None)
                 page.evaluate('refresh()')
                 assert page.locator('[data-capture-browser="open"]').is_hidden()
                 page.screenshot(path=str(output / "streaming-desktop.png"))
                 page.set_viewport_size({"width": 390, "height": 844})
                 page.screenshot(path=str(output / "streaming-narrow.png"))
                 page.get_by_role("button", name="停止抓取", exact=True).click()
-                page.wait_for_function("state.job.status === 'stopping'")
-                assert app.job_cancel.is_set()
-                app.job.update(running=False, status="stopped", message="已停止抓取，已保留 20001 条商品")
-                page.wait_for_function("!state.job.running")
+                wait_for_state(page, "state.job.status === 'stopping'")
+                assert jobs.job_cancel.is_set()
+                jobs.job.update(running=False, status="stopped", message="已停止抓取，已保留 20001 条商品")
+                wait_for_state(page, "!state.job.running")
                 page.locator("#capture-bar").wait_for(state="hidden")
                 assert page.locator(".catalog tbody tr").count() == 100
                 assert not errors, errors

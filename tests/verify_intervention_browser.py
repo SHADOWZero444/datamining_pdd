@@ -5,9 +5,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import pdd_search as scraper
-import capture_verification
-from capture_view import CaptureView
+from pdd.scraping import collector as scraper
+from pdd.browser import verification as capture_verification
+from pdd.browser.view import CaptureView
 from playwright.sync_api import sync_playwright
 
 

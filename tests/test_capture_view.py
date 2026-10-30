@@ -6,8 +6,11 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 from unittest.mock import patch
 
-import app
-from capture_view import CaptureView
+from pdd.server import http as app
+from pdd.storage import results, library
+from pdd.services import auth as auth_service, jobs
+from pdd.scraping import filters as filter_tools, service
+from pdd.browser.view import CaptureView
 
 
 class CaptureViewTests(unittest.TestCase):
@@ -33,8 +36,8 @@ class CaptureViewTests(unittest.TestCase):
         view = CaptureView()
         current = {"running": True, "id": "fixture-current", "browser_available": True, "status": "verification", "intervention_kind": "verification"}
         resume = threading.Event()
-        with patch.object(app, "job", current), patch.object(app, "job_capture_view", view), \
-             patch.object(app, "job_resume_request", resume):
+        with patch.object(jobs, "job", current), patch.object(jobs, "job_capture_view", view), \
+             patch.object(jobs, "job_resume_request", resume):
             server = ThreadingHTTPServer(("127.0.0.1", 0), app.AppHandler)
             threading.Thread(target=server.serve_forever, daemon=True).start()
             origin = f"http://127.0.0.1:{server.server_port}"

@@ -1,0 +1,140 @@
+"""单个后台抓取任务的状态、取消信号与结果持久化。"""
+import json
+import threading
+import time
+from pdd.browser.view import CaptureView
+from pdd.storage import results, library
+from . import auth as auth_service
+from uuid import uuid4
+
+# job 是当前这一次抓取。界面轮询它，不在请求里直接开浏览器。
+job = {
+    "running": False,
+    "keyword": "",
+    "status": "idle",
+    "message": "",
+    "count": 0,
+    "total": None,
+}
+job_lock = threading.RLock()
+job_cancel = None
+job_browser_request = None
+job_resume_request = None
+job_capture_view = None
+
+def run_job(keyword, limit, filters, cancel_event):
+    diagnostics = {}
+    capture_view = job_capture_view
+    try:
+        from pdd.scraping.service import run_search
+
+        def report_progress(message, count, total=None):
+            with job_lock:
+                if job.get("running") and not cancel_event.is_set():
+                    job.update({"message": message, "count": count, "total": total,
+                                "scanned": diagnostics.get("scanned", 0)})
+
+        def save_batch(rows):
+            with results.data_lock:
+                saved = results.merge_goods(keyword, rows)
+            with job_lock:
+                job["saved"] = len(saved)
+
+        def report_intervention(status, message, kind):
+            with job_lock:
+                if not cancel_event.is_set():
+                    job.update(status=status, message=message, intervention_kind=kind)
+
+        def browser_ready(ready):
+            with job_lock:
+                job["browser_available"] = ready
+
+        goods, total, errors = run_search(
+            keyword,
+            limit=limit,
+            filters=filters,
+            cancel_event=cancel_event,
+            progress=report_progress,
+            on_batch=save_batch,
+            diagnostics=diagnostics,
+            on_intervention=report_intervention,
+            browser_request=job_browser_request,
+            resume_request=job_resume_request,
+            on_browser_ready=browser_ready,
+            capture_view=capture_view,
+        )
+        saved = results.merge_goods(keyword, goods) if goods else results.read_jsonl(results.result_path(keyword))
+        stopped = cancel_event.is_set()
+        if stopped:
+            message = f"已停止抓取，已保留 {len(saved)} 条商品"
+            status = "stopped"
+        elif goods:
+            reason = errors[-1] if errors else diagnostics.get("message", "本次抓取结束")
+            message = f"{reason}。本次保存 {len(goods)} 条，库里共 {len(saved)} 条"
+            status = "ok" if not errors else "partial"
+        elif saved:
+            message = (errors[-1] + "。原来的数据还在。") if errors else "这次没有新商品，原来的数据还在。"
+            status = "partial"
+        else:
+            message = errors[-1] if errors else "没有抓到商品"
+            status = "failed"
+        with job_lock:
+            job.update({
+                "status": status,
+                "message": message,
+                "count": len(saved),
+                "total": total,
+                "stop_reason": diagnostics.get("stop_reason"),
+                "browser_available": False,
+                "intervention_kind": None,
+            })
+    except Exception as exc:
+        try:
+            saved = results.read_jsonl(results.result_path(keyword))
+            saved_count = len(saved)
+        except OSError:
+            saved_count = job.get("saved", 0)
+        with job_lock:
+            job.update({
+                "status": "partial" if saved_count else "failed",
+                "message": f"抓取中断，已保存的数据仍然保留。{str(exc)}",
+                "count": saved_count,
+                "browser_available": False,
+            })
+        diagnostics.update(stop_reason="error", error_type=type(exc).__name__)
+    finally:
+        if capture_view:
+            capture_view.close()
+        diagnostics.update(keyword=keyword, limit=limit, finished_at=int(time.time()))
+        try:
+            results.atomic_write(results.result_path(keyword).with_suffix(".run.json"),
+                         json.dumps(diagnostics, ensure_ascii=False, indent=2))
+        except OSError:
+            pass
+        finally:
+            with job_lock:
+                job["running"] = False
+
+
+def start_job(keyword, limit, filters):
+    """初始化失败不占用任务槽；持锁完成状态发布与线程启动。"""
+    global job_cancel, job_browser_request, job_resume_request, job_capture_view
+    with job_lock, auth_service.auth_lock:
+        if auth_service.auth["running"]:
+            raise RuntimeError("请先完成当前登录，再开始抓取。")
+        if job["running"]:
+            raise RuntimeError("已有抓取在进行，请等它结束。")
+        results.save_search_metadata(keyword, filters)
+        library.ensure_library_entry(keyword)
+        job_cancel = threading.Event()
+        job_browser_request = threading.Event()
+        job_resume_request = threading.Event()
+        job_capture_view = CaptureView()
+        job.update(running=True, keyword=keyword, status="running", message="正在打开搜索页",
+                   count=0, total=None, scanned=0, saved=0, stop_reason=None,
+                   id=uuid4().hex, browser_available=False, intervention_kind=None)
+        try:
+            threading.Thread(target=run_job, args=(keyword, limit, filters, job_cancel), daemon=False).start()
+        except Exception:
+            job.update(running=False, status="failed", message="无法启动抓取，请重试。")
+            raise

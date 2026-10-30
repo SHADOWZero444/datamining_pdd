@@ -27,20 +27,6 @@ def browser_executable():
     raise RuntimeError("请先安装 Microsoft Edge 或 Chrome，再开始抓取。")
 
 
-def bring_capture_to_front(page):
-    """在浏览器所属线程处理请求；恢复原窗口，不新开验证链接。"""
-    session = page.context.new_cdp_session(page)
-    try:
-        try:
-            window = session.send("Browser.getWindowForTarget")
-            session.send("Browser.setWindowBounds", {"windowId": window["windowId"], "bounds": {"windowState": "normal"}})
-        except Exception:
-            pass
-        page.bring_to_front()
-    finally:
-        session.detach()
-
-
 def fingerprint(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 

@@ -1,12 +1,12 @@
 # Dependencies
 node_modules/
+.venv/
 .artifacts/
 
 # Build output
 dist/
 # PyInstaller 临时目录。打包脚本 build/build_exe.ps1 要保留。
-build/*
-!build/build_exe.ps1
+build/datamining-pdd/
 
 # Environment / secrets
 .env

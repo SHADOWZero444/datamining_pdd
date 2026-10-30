@@ -9,8 +9,11 @@ from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 from http.server import ThreadingHTTPServer
 
-import app
-import pdd_search as scraper
+from pdd.server import http as app
+from pdd.storage import results, library
+from pdd.services import auth as auth_service, jobs
+from pdd.scraping import filters as filter_tools, service
+from pdd.scraping import collector as scraper
 
 
 def row(n, price="10"):
@@ -64,7 +67,7 @@ class FakePage:
 class CollectorTests(unittest.TestCase):
     def collect(self, page, **kwargs):
         current_state = kwargs.pop("page_state", "")
-        with patch.object(scraper, "read_live_goods", side_effect=lambda _: page.batches[min(page.index, len(page.batches)-1)]), \
+        with patch.object(scraper, "read_live_goods", side_effect=lambda _, **kwargs: page.batches[min(page.index, len(page.batches)-1)]), \
              patch.object(scraper, "read_dom_goods", return_value=[]), \
              patch.object(scraper, "scroll_results", side_effect=lambda _: page.scroll()), \
              patch.object(scraper, "page_state", return_value=current_state), \
@@ -90,6 +93,22 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(total, 20)
         self.assertEqual(stats["stop_reason"], "end")
         self.assertEqual(len(batches), 2)
+
+    def test_keywords_filter_before_streaming_and_counting_limit(self):
+        page = FakePage([
+            [{**row(1), "title": "普通耳机"}, {**row(2), "title": "蓝牙耳机"}],
+            [{**row(3), "title": "蓝牙降噪耳机"}, {**row(4), "title": "二手蓝牙降噪耳机"}],
+            [{**row(5), "title": "新款蓝牙降噪耳机"}],
+        ])
+        batches, stats = [], {}
+        goods, _ = self.collect(page, limit=2,
+                                filters={"required_words": "蓝牙,降噪", "banned": "二手"},
+                                on_batch=batches.append, diagnostics=stats)
+        self.assertEqual([item["goods_id"] for item in goods], ["3", "5"])
+        self.assertEqual([item["goods_id"] for batch in batches for item in batch], ["3", "5"])
+        self.assertEqual(stats["scanned"], 5)
+        self.assertEqual(stats["matched"], 2)
+        self.assertEqual(stats["stop_reason"], "limit")
 
     def test_stall_is_partial_and_listener_removed(self):
         page, stats = FakePage([[row(1)]]), {}
@@ -218,14 +237,14 @@ class StorageTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
-        self.patches = [patch.object(app, "ROOT", self.root),
-                        patch.object(app, "DATA_DIR", self.root / "searches"),
-                        patch.object(app, "LIBRARY_FILE", self.root / "library.json")]
+        self.patches = [patch.object(auth_service, "ROOT", self.root),
+                        patch.object(results, "DATA_DIR", self.root / "searches"),
+                        patch.object(library, "LIBRARY_FILE", self.root / "library.json")]
         for item in self.patches:
             item.start()
-        app.job.update(running=False, keyword="", status="idle")
-        app.result_feeds.clear()
-        app._read_jsonl_cached.cache_clear()
+        jobs.job.update(running=False, keyword="", status="idle")
+        results.result_feeds.clear()
+        results._read_jsonl_cached.cache_clear()
 
     def tearDown(self):
         for item in reversed(self.patches):
@@ -233,41 +252,41 @@ class StorageTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_delta_updates_deletes_and_unknown_revision(self):
-        app.merge_goods("测试", [row(1), row(2)])
-        first = app.result_feed("测试")
-        self.assertTrue(app.result_feed("测试", first["revision"])["unchanged"])
-        app.merge_goods("测试", [row(1, "12"), row(3)])
-        second = app.result_feed("测试", first["revision"])
+        results.merge_goods("测试", [row(1), row(2)])
+        first = results.result_feed("测试")
+        self.assertTrue(results.result_feed("测试", first["revision"])["unchanged"])
+        results.merge_goods("测试", [row(1, "12"), row(3)])
+        second = results.result_feed("测试", first["revision"])
         self.assertTrue(second["delta"])
         self.assertEqual({r["goods_id"] for r in second["goods"]}, {"1", "3"})
-        app.write_jsonl(app.result_path("测试"), [r for r in app.load_goods("测试") if r["goods_id"] != "2"])
-        third = app.result_feed("测试", first["revision"])
+        results.write_jsonl(results.result_path("测试"), [r for r in results.load_goods("测试") if r["goods_id"] != "2"])
+        third = results.result_feed("测试", first["revision"])
         self.assertEqual(third["removed"], ["2"])
-        self.assertEqual(len(app.result_feed("测试", "expired")["goods"]), 2)
+        self.assertEqual(len(results.result_feed("测试", "expired")["goods"]), 2)
 
     def test_atomic_write_failure_preserves_old_file(self):
-        path = app.result_path("测试")
-        app.write_jsonl(path, [row(1)])
-        with patch.object(app.os, "replace", side_effect=OSError("disk unavailable")):
+        path = results.result_path("测试")
+        results.write_jsonl(path, [row(1)])
+        with patch.object(results.os, "replace", side_effect=OSError("disk unavailable")):
             with self.assertRaises(OSError):
-                app.write_jsonl(path, [row(2)])
-        self.assertEqual(app.read_jsonl(path), [row(1)])
+                results.write_jsonl(path, [row(2)])
+        self.assertEqual(results.read_jsonl(path), [row(1)])
         self.assertFalse(list(path.parent.glob("*.tmp")))
 
     def test_run_job_publishes_before_return_and_preserves_on_error(self):
         event = threading.Event()
         def fake_search(keyword, on_batch, **kwargs):
             on_batch([row(1)])
-            self.assertEqual(len(app.result_feed(keyword)["goods"]), 1)
-            self.assertTrue(app.job["running"])
+            self.assertEqual(len(results.result_feed(keyword)["goods"]), 1)
+            self.assertTrue(jobs.job["running"])
             raise RuntimeError("simulated browser crash")
-        app.job.update(running=True, keyword="测试")
-        with patch.object(scraper, "run_search", side_effect=fake_search):
-            app.run_job("测试", None, {}, event)
-        self.assertFalse(app.job["running"])
-        self.assertEqual(app.job["status"], "partial")
-        self.assertEqual(len(app.load_goods("测试")), 1)
-        self.assertEqual(json.loads((app.DATA_DIR / "测试.run.json").read_text(encoding="utf-8"))["stop_reason"], "error")
+        jobs.job.update(running=True, keyword="测试")
+        with patch.object(service, "run_search", side_effect=fake_search):
+            jobs.run_job("测试", None, {}, event)
+        self.assertFalse(jobs.job["running"])
+        self.assertEqual(jobs.job["status"], "partial")
+        self.assertEqual(len(results.load_goods("测试")), 1)
+        self.assertEqual(json.loads((results.DATA_DIR / "测试.run.json").read_text(encoding="utf-8"))["stop_reason"], "error")
 
     def test_http_stream_stop_and_blank_limit(self):
         server = ThreadingHTTPServer(("127.0.0.1", 0), app.AppHandler)
@@ -284,10 +303,10 @@ class StorageTests(unittest.TestCase):
             ended.set()
             return [row(1)], None, []
         def post(path, payload):
-            req = Request(endpoint + path, json.dumps(payload).encode(), {"Content-Type": "application/json"})
+            req = Request(endpoint + path, json.dumps(payload).encode(), {"Content-Type": "application/json", "X-PDD-App": "1"})
             return json.load(urlopen(req, timeout=5))
         try:
-            with patch.object(scraper, "run_search", side_effect=fake_search):
+            with patch.object(service, "run_search", side_effect=fake_search):
                 for bad in [0, -1, 1.2, True, "10001"]:
                     with self.assertRaises(HTTPError) as error:
                         post("/api/search", {"keyword": "测试", "limit": bad})
@@ -295,7 +314,7 @@ class StorageTests(unittest.TestCase):
                 post("/api/search", {"keyword": "测试", "limit": ""})
                 self.assertTrue(ready.wait(3))
                 self.assertEqual(limits, [None])
-                self.assertEqual(len(json.load(urlopen(endpoint + "/api/results?keyword=%E6%B5%8B%E8%AF%95"))["goods"]), 1)
+                self.assertEqual(len(json.load(urlopen(Request(endpoint + "/api/results?keyword=%E6%B5%8B%E8%AF%95", headers={"X-PDD-App": "1"})))["goods"]), 1)
                 post("/api/search/stop", {})
                 self.assertTrue(ended.wait(3))
         finally:
