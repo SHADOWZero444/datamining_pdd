@@ -23,10 +23,16 @@ job_resume_request = None
 job_capture_view = None
 
 def run_job(keyword, limit, filters, cancel_event):
+    started_at = time.monotonic()
     diagnostics = {}
     capture_view = job_capture_view
     try:
         from pdd.scraping.service import run_search
+
+        existing_goods = results.read_jsonl(results.result_path(keyword))
+        existing_ids = {str(row["goods_id"]) for row in existing_goods if row.get("goods_id")}
+        with job_lock:
+            job["saved"] = len(existing_goods)
 
         def report_progress(message, count, total=None):
             with job_lock:
@@ -53,6 +59,7 @@ def run_job(keyword, limit, filters, cancel_event):
             keyword,
             limit=limit,
             filters=filters,
+            existing_goods=existing_goods,
             cancel_event=cancel_event,
             progress=report_progress,
             on_batch=save_batch,
@@ -64,13 +71,18 @@ def run_job(keyword, limit, filters, cancel_event):
             capture_view=capture_view,
         )
         saved = results.merge_goods(keyword, goods) if goods else results.read_jsonl(results.result_path(keyword))
+        new_count = len({str(row["goods_id"]) for row in saved if row.get("goods_id")} - existing_ids)
+        diagnostics["saved_new_goods"] = new_count
         stopped = cancel_event.is_set()
         if stopped:
             message = f"已停止抓取，已保留 {len(saved)} 条商品"
             status = "stopped"
+        elif diagnostics.get("stop_reason") == "limit" and not errors:
+            message = f"已达到累计目标 {limit} 条，本次新增 {new_count} 条，库里共 {len(saved)} 条"
+            status = "ok"
         elif goods:
             reason = errors[-1] if errors else diagnostics.get("message", "本次抓取结束")
-            message = f"{reason}。本次保存 {len(goods)} 条，库里共 {len(saved)} 条"
+            message = f"{reason}。本次新增 {new_count} 条，库里共 {len(saved)} 条"
             status = "ok" if not errors else "partial"
         elif saved:
             message = (errors[-1] + "。原来的数据还在。") if errors else "这次没有新商品，原来的数据还在。"
@@ -78,6 +90,10 @@ def run_job(keyword, limit, filters, cancel_event):
         else:
             message = errors[-1] if errors else "没有抓到商品"
             status = "failed"
+        if limit is not None and not stopped and diagnostics.get("cumulative_matched", 0) < limit:
+            if saved:
+                status = "partial"
+            message += f"。累计符合条件 {diagnostics.get('cumulative_matched', 0)}/{limit} 条，目标尚未完成"
         with job_lock:
             job.update({
                 "status": status,
@@ -105,7 +121,8 @@ def run_job(keyword, limit, filters, cancel_event):
     finally:
         if capture_view:
             capture_view.close()
-        diagnostics.update(keyword=keyword, limit=limit, finished_at=int(time.time()))
+        diagnostics.update(keyword=keyword, limit=limit, finished_at=int(time.time()),
+                           elapsed_seconds=round(time.monotonic() - started_at, 2))
         try:
             results.atomic_write(results.result_path(keyword).with_suffix(".run.json"),
                          json.dumps(diagnostics, ensure_ascii=False, indent=2))

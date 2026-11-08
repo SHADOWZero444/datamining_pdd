@@ -96,9 +96,9 @@ function createSearchFeature({ state, preferences, TAGS, badgeText, esc, money, 
           <p class="help">多个禁用词请用英文逗号 , 分隔。例如：二手,翻新</p>
         </div>
         <div class="scrape-limit">
-          <label class="field-label" for="scrape-limit">本次抓取上限</label>
+          <label class="field-label" for="scrape-limit">累计商品目标</label>
           <div class="limit-input"><input id="scrape-limit" name="limit" type="number" min="1" max="10000" step="1" inputmode="numeric" placeholder="不限" aria-describedby="limit-help" value="${esc(state.form.limit)}"></div>
-          <p class="help" id="limit-help">留空将持续抓取，直到你停止或页面没有更多结果。也可填写 1–10000，达到符合筛选条件的条数后停止。结果会边抓取边保存。</p>
+          
         </div>
         <p class="error" id="form-error" role="alert"></p>
         <button class="start" type="submit" ${state.job.running ? "disabled" : ""}>${state.job.running ? "正在抓取" : "开始"}</button>

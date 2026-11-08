@@ -246,7 +246,9 @@ def merge_goods(keyword, new_rows):
             row["shop_name"] = previous.get("shop_name") or ""
         merged[goods_id] = {**previous, **row}
     rows = list(merged.values())
-    ensure_seq(rows)
-    if rows:
+    changed = rows != old
+    assigned_seq = ensure_seq(rows)
+    # 重复读取未变化的商品不再重写整个文件，减少续抓时的磁盘等待。
+    if rows and (changed or assigned_seq):
         write_jsonl(result_path(keyword), rows)
     return rows

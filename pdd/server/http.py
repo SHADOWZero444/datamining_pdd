@@ -110,6 +110,14 @@ class AppHandler(LocalHandler):
                     self.send_json({"ok": False, "message": "抓取任务已变化，请刷新后重试。"}, 409)
                     return
                 action = payload.get("action")
+                if action == "resume" and jobs.job["status"] == "paused":
+                    if jobs.job.get("intervention_kind") != "rate_limit_ready" or jobs.job_resume_request is None:
+                        self.send_json({"ok": False, "message": "请等待当前冷却结束后再继续。"}, 409)
+                        return
+                    jobs.job_resume_request.set()
+                    jobs.job.update(status="resuming", message="正在恢复抓取…")
+                    self.send_json({"ok": True})
+                    return
                 if action != "close" and not (jobs.job["status"] == "verification" and jobs.job.get("intervention_kind") == "verification"):
                     self.send_json({"ok": False, "message": "当前无需人工验证，抓取会在后台进行。"}, 409)
                     return
@@ -164,7 +172,7 @@ class AppHandler(LocalHandler):
         raw_limit = payload.get("limit")
         limit = None
         if raw_limit not in (None, "") and (not re.fullmatch(r"[1-9][0-9]*", str(raw_limit)) or int(raw_limit) > 10000):
-            self.send_json({"ok": False, "message": "抓取上限请留空，或填写 1 到 10000 之间的整数。"}, 400)
+            self.send_json({"ok": False, "message": "累计商品目标请留空，或填写 1 到 10000 之间的整数。"}, 400)
             return
         if raw_limit not in (None, ""):
             limit = int(raw_limit)

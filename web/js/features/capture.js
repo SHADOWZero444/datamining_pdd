@@ -20,7 +20,11 @@ function createCaptureFeature({ state, capturePanel }) {
     open.hidden = !needsVerification;
     open.disabled = state.job.status === "stopping";
     open.textContent = state.job.status === "verification" && state.job.intervention_kind !== "loading" ? "前往验证" : "查看抓取页面";
-    resume.hidden = !needsVerification;
+    const paused = state.job.status === "paused";
+    const cooling = paused && state.job.intervention_kind !== "rate_limit_ready";
+    resume.hidden = !needsVerification && !paused;
+    resume.disabled = cooling || state.job.status === "stopping";
+    resume.textContent = cooling ? "冷却中…" : "继续抓取";
   }
 
 

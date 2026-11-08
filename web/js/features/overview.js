@@ -2,13 +2,13 @@
 const FEATURE_CARDS = [
   {
     id: "keyword-search", title: "词条搜索爬取",
-    description: "输入关键词，按条件查找商品，边抓取边查看结果。",
+    description: "",
     image: "assets/features/keyword-search.png", fallback: "从一个关键词开始",
     action: "keywordSearch", enabled: true,
   },
   {
     id: "coming-soon", title: "尚未开发",
-    description: "此功能暂未开放，当前不可使用。",
+    description: "",
     image: "assets/features/coming-soon.png", fallback: "留给下一种可能",
     action: null, enabled: false,
   },

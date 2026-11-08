@@ -14,6 +14,7 @@ from pdd.storage import results, library
 from pdd.services import auth as auth_service, jobs
 from pdd.scraping import filters as filter_tools, service
 from pdd.scraping import collector as scraper
+from pdd.scraping import page as page_tools
 
 
 def row(n, price="10"):
@@ -49,7 +50,12 @@ class FakePage:
 
     def goto(self, *args, **kwargs):
         for response in self.responses.get(0, []):
-            self.callbacks["response"](response)
+            self.emit_response(response)
+
+    def emit_response(self, response):
+        self.callbacks["request"](response)
+        self.callbacks["response"](response)
+        self.callbacks["requestfinished"](response)
 
     def wait_for_timeout(self, ms):
         self.clock += ms / 1000
@@ -61,7 +67,7 @@ class FakePage:
         if self.index == self.fail_at:
             raise RuntimeError("simulated page crash")
         for response in self.responses.get(self.index, []):
-            self.callbacks["response"](response)
+            self.emit_response(response)
 
 
 class CollectorTests(unittest.TestCase):
@@ -69,7 +75,7 @@ class CollectorTests(unittest.TestCase):
         current_state = kwargs.pop("page_state", "")
         with patch.object(scraper, "read_live_goods", side_effect=lambda _, **kwargs: page.batches[min(page.index, len(page.batches)-1)]), \
              patch.object(scraper, "read_dom_goods", return_value=[]), \
-             patch.object(scraper, "scroll_results", side_effect=lambda _: page.scroll()), \
+             patch.object(scraper, "scroll_results", side_effect=lambda _, **options: page.scroll()), \
              patch.object(scraper, "page_state", return_value=current_state), \
              patch.object(scraper.time, "monotonic", side_effect=lambda: page.clock):
             return scraper.collect(page, **kwargs)
@@ -192,7 +198,7 @@ class CollectorTests(unittest.TestCase):
         page.wait_hook = complete
         goods, _ = self.collect(page, limit=2)
         self.assertEqual(len(goods), 2)
-        self.assertGreaterEqual(page.first_scroll, 3)
+        self.assertGreaterEqual(page.first_scroll, 3 + scraper.MIN_PAGE_INTERVAL)
         self.assertFalse(page.callbacks)
 
     def test_user_takeover_pauses_scroll_and_remains_cancellable(self):
@@ -231,6 +237,240 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(button.click.call_count, 1)
         self.assertGreaterEqual(clicked_at[0], 29.999)
         self.assertEqual(stats["stop_reason"], "stopped")
+
+    def test_recovers_after_180_and_four_separate_limits_to_1200(self):
+        class PagedApi(FakePage):
+            """每次真实调用生产解析器，模拟 20 条一页；429 不推进页码。"""
+            def __init__(self):
+                super().__init__([[]])
+                self.served = 0
+                self.limited_at = set()
+                self.requests = []
+
+            def goto(self, *args, **kwargs):
+                self.scroll()
+
+            def scroll(self):
+                limited = self.served in (180, 400, 600, 800) and self.served not in self.limited_at
+                self.requests.append((self.clock, 429 if limited else 200))
+                if limited:
+                    self.limited_at.add(self.served)
+                    self.emit_response(Response(status=429, retry="45"))
+                    return
+                end = min(1200, self.served + 20)
+                items = [{"item_data": {"goods_model": {"goods_id": str(n), "goods_name": f"商品{n}"}}}
+                         for n in range(self.served + 1, end + 1)]
+                self.served = end
+                self.emit_response(Response({"items": items, "has_more": end < 1200, "total": 300}))
+
+        page, stats, batches = PagedApi(), {}, []
+        button = Mock()
+        button.click.side_effect = lambda **kwargs: page.scroll()
+        with patch.object(scraper, "loading_error_retry_button", return_value=button):
+            goods, total = self.collect(page, diagnostics=stats, on_batch=batches.append)
+        self.assertEqual(len({item["goods_id"] for item in goods}), 1200)
+        self.assertEqual(len({item["goods_id"] for batch in batches for item in batch}), 1200)
+        self.assertEqual(total, 300)
+        self.assertEqual(stats["stop_reason"], "end")
+        self.assertEqual(stats["rate_limits"], 4)
+        self.assertEqual(stats["rate_limit_recoveries"], 4)
+        self.assertEqual(stats["consecutive_rate_limits"], 0)
+        self.assertEqual(stats["rate_limit_retries"], 4)
+        self.assertEqual(stats["page_retries"], 0)
+        self.assertEqual(stats["page_interval_seconds"], scraper.MAX_PAGE_INTERVAL)
+        for (before, status), (after, _) in zip(page.requests, page.requests[1:]):
+            self.assertGreaterEqual(after - before + .001, 45 if status == 429 else scraper.MIN_PAGE_INTERVAL)
+        self.assertEqual(len(stats["response_timeline"]), 60)
+        self.assertFalse(page.callbacks)
+
+    def test_duplicate_success_pages_do_not_reset_rate_limit_budget(self):
+        item = {"item_data": {"goods_model": {"goods_id": "1", "goods_name": "商品1"}}}
+        responses = {0: [Response({"items": [item]})]}
+        for index in range(1, 8):
+            responses[index] = [Response(status=429) if index % 2 else Response({"items": [item]})]
+        stats = {}
+        goods, _ = self.collect(FakePage([[row(1)]], responses), diagnostics=stats)
+        self.assertEqual(len(goods), 1)
+        self.assertEqual(stats["stop_reason"], "rate_limited")
+        self.assertEqual(stats["consecutive_rate_limits"], 4)
+        self.assertEqual(stats["rate_limit_recoveries"], 0)
+
+    def test_successful_encrypted_page_and_new_dom_rows_reset_budget(self):
+        page = FakePage([[row(1)], [row(1), row(2)]], {
+            0: [Response(status=429)],
+            1: [Response({"rc-res-data": "test-only-wrapped-response", "content-type": "application/json"})],
+            2: [Response({"items": [], "has_more": False})],
+        })
+        stats = {}
+        goods, _ = self.collect(page, diagnostics=stats, limit=2)
+        self.assertEqual(len(goods), 2)
+        self.assertEqual(stats["rate_limit_recoveries"], 1)
+        self.assertEqual(stats["stop_reason"], "limit")
+
+    def test_new_dom_rows_without_success_do_not_reset_budget(self):
+        page = FakePage([[row(n) for n in range(i + 1)] for i in range(4)],
+                        {i: [Response(status=429)] for i in range(4)})
+        stats = {}
+        self.collect(page, diagnostics=stats)
+        self.assertEqual(stats["stop_reason"], "rate_limited")
+        self.assertEqual(stats["rate_limit_recoveries"], 0)
+
+    def test_business_failure_does_not_count_as_recovery(self):
+        page = FakePage([[row(1)], [row(1), row(2)]], {
+            0: [Response(status=429)],
+            1: [Response({"success": False, "data": {"items": []}})],
+            2: [Response(status=429)], 3: [Response(status=429)], 4: [Response(status=429)],
+        })
+        stats = {}
+        self.collect(page, diagnostics=stats)
+        self.assertEqual(stats["stop_reason"], "rate_limited")
+        self.assertEqual(stats["rate_limit_recoveries"], 0)
+
+    def test_429_during_cooldown_extends_deadline(self):
+        page = FakePage([[row(1)]], {0: [Response(status=429, retry="30")]})
+        button, stats, clicked_at = Mock(), {}, []
+        cancelled = threading.Event()
+        delayed_at = []
+        def arrive():
+            if page.clock >= 10 and not delayed_at:
+                delayed_at.append(page.clock)
+                page.emit_response(Response(status=429, retry="90"))
+        def clicked(**kwargs):
+            clicked_at.append(page.clock)
+            cancelled.set()
+        page.wait_hook = arrive
+        button.click.side_effect = clicked
+        with patch.object(scraper, "loading_error_retry_button", return_value=button):
+            self.collect(page, should_stop=cancelled.is_set, diagnostics=stats)
+        self.assertEqual(len(clicked_at), 1)
+        self.assertGreaterEqual(clicked_at[0] + .001, delayed_at[0] + 90)
+        self.assertEqual(stats["rate_limits"], 2)
+        self.assertEqual(stats["stop_reason"], "stopped")
+
+    def test_multiple_retry_headers_use_longest_wait(self):
+        page = FakePage([[row(1)]], {0: [Response(status=429, retry="30"), Response(status=429, retry="180")]})
+        button, clicked_at = Mock(), []
+        cancelled = threading.Event()
+        def clicked(**kwargs):
+            clicked_at.append(page.clock)
+            cancelled.set()
+        button.click.side_effect = clicked
+        with patch.object(scraper, "loading_error_retry_button", return_value=button):
+            self.collect(page, should_stop=cancelled.is_set)
+        self.assertGreaterEqual(clicked_at[0], 179.999)
+
+    def test_no_retry_click_while_request_is_pending(self):
+        class PendingPage(FakePage):
+            def goto(self, *args, **kwargs):
+                self.request = Response(status=429)
+                self.callbacks["request"](self.request)
+                self.callbacks["response"](self.request)
+        page = PendingPage([[row(1)]])
+        button, clicked_at, finished_at = Mock(), [], []
+        cancelled = threading.Event()
+        def complete():
+            if page.clock >= 40 and not finished_at:
+                finished_at.append(page.clock)
+                page.callbacks["requestfinished"](page.request)
+        def clicked(**kwargs):
+            clicked_at.append(page.clock)
+            cancelled.set()
+        page.wait_hook = complete
+        button.click.side_effect = clicked
+        with patch.object(scraper, "loading_error_retry_button", return_value=button):
+            self.collect(page, should_stop=cancelled.is_set)
+        self.assertGreaterEqual(clicked_at[0], finished_at[0] + scraper.MAX_PAGE_INTERVAL - .001)
+
+    def test_verification_during_cooldown_does_not_click_retry(self):
+        page = FakePage([[row(1)]], {0: [Response(status=429)]})
+        button, stats = Mock(), {}
+        page.wait_hook = lambda: page.callbacks["response"](Response({"message": "请完成验证", "data": {"items": []}}))
+        with patch.object(scraper, "loading_error_retry_button", return_value=button):
+            self.collect(page, diagnostics=stats)
+        button.click.assert_not_called()
+        self.assertEqual(stats["stop_reason"], "verification")
+
+    def test_manual_verification_does_not_discard_retry_after(self):
+        page = FakePage([[row(1)]], {0: [Response(status=429, retry="90"),
+                                      Response({"message": "请完成验证"})]})
+        page.mouse = Mock()
+        button, stats, clicked_at = Mock(), {}, []
+        cancelled = threading.Event()
+        def clicked(**kwargs):
+            clicked_at.append(page.clock)
+            cancelled.set()
+        button.click.side_effect = clicked
+        with patch.object(scraper, "loading_error_retry_button", return_value=button), \
+             patch.object(scraper, "handle_verification", return_value="resumed"):
+            self.collect(page, on_intervention=Mock(), should_stop=cancelled.is_set, diagnostics=stats)
+        page.mouse.wheel.assert_not_called()
+        self.assertGreaterEqual(clicked_at[0], 89.999)
+        self.assertEqual(stats["stop_reason"], "stopped")
+
+    def test_429_during_network_retry_wait_prevents_early_click(self):
+        page, button, stats = FakePage([[row(1)]]), Mock(), {}
+        limited_at, clicked_at = [], []
+        cancelled = threading.Event()
+        def arrive():
+            if page.clock >= scraper.STALL_SECONDS + 1 and not limited_at:
+                limited_at.append(page.clock)
+                page.emit_response(Response(status=429, retry="90"))
+        def clicked(**kwargs):
+            clicked_at.append(page.clock)
+            cancelled.set()
+        page.wait_hook = arrive
+        button.click.side_effect = clicked
+        with patch.object(scraper, "loading_error_retry_button", return_value=button):
+            self.collect(page, should_stop=cancelled.is_set, diagnostics=stats)
+        self.assertGreaterEqual(clicked_at[0] + .001, limited_at[0] + 90)
+        self.assertEqual(stats["rate_limit_retries"], 1)
+        self.assertEqual(stats["page_retries"], 0)
+
+    def test_user_takeover_during_cooldown_never_clicks_retry(self):
+        page = FakePage([[row(1)]], {0: [Response(status=429)]})
+        view, button, stats = app.CaptureView(), Mock(), {}
+        cancelled = threading.Event()
+        def take_over():
+            view.open()
+            if page.clock >= 35:
+                cancelled.set()
+        page.wait_hook = take_over
+        with patch.object(scraper, "loading_error_retry_button", return_value=button), patch.object(view, "service"):
+            self.collect(page, capture_view=view, should_stop=cancelled.is_set, diagnostics=stats)
+        button.click.assert_not_called()
+        self.assertEqual(page.index, 0)
+        self.assertEqual(stats["stop_reason"], "stopped")
+
+
+class PageRecoveryTests(unittest.TestCase):
+    def test_retry_after_formats(self):
+        from datetime import datetime, timezone
+        now = datetime(2026, 10, 31, tzinfo=timezone.utc)
+        with patch.object(page_tools, "datetime") as clock:
+            clock.now.return_value = now
+            self.assertEqual(page_tools.retry_delay("Sat, 31 Oct 2026 00:02:00 GMT", 30), 120)
+            self.assertEqual(page_tools.retry_delay("Sat, 31 Oct 2026 00:00:10 GMT", 30), 30)
+        self.assertEqual(page_tools.retry_delay(" 180 ", 30), 180)
+        for value in (None, "", "invalid", "-1", "0"):
+            self.assertEqual(page_tools.retry_delay(value, 30), 30)
+
+    def test_only_explicit_recovery_leaves_bottom(self):
+        page = Mock()
+        page.evaluate.return_value = {"x": 100, "y": 200, "at_bottom": True, "step": 0}
+        page_tools.scroll_results(page)
+        page.mouse.wheel.assert_not_called()
+        page_tools.scroll_results(page, retry_bottom=True)
+        page.mouse.move.assert_called_once_with(100, 200)
+        page.mouse.wheel.assert_called_once_with(0, -120)
+
+    def test_response_summary_has_counts_without_raw_payload(self):
+        data = {"data": {"items": [{"secret": "do-not-store"}], "has_more": True, "is_repeated": False},
+                "token": "do-not-store"}
+        summary = page_tools.response_summary(data, Response(data))
+        self.assertEqual(summary["item_count"], 1)
+        self.assertTrue(summary["has_more"])
+        self.assertFalse(summary["is_repeated"])
+        self.assertNotIn("do-not-store", json.dumps(summary))
 
 
 class StorageTests(unittest.TestCase):

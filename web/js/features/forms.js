@@ -56,7 +56,7 @@ function createFormHandler({ state, api, render, applyListTools, viewOf, sortedA
       return;
     }
     if (limit && (!/^[1-9]\d*$/.test(limit) || Number(limit) > 10000)) {
-      error.textContent = "抓取上限请留空，或填写 1 到 10000 之间的整数。";
+      error.textContent = "累计商品目标请留空，或填写 1 到 10000 之间的整数。";
       return;
     }
     error.textContent = "";

@@ -1,5 +1,6 @@
 """把页面卡片及搜索接口归一化为商品记录；不保存数据或驱动任务。"""
 from urllib.parse import urljoin
+from playwright.sync_api import Error as BrowserError
 from .constants import BASE
 
 BADGE_MARKS = {
@@ -35,9 +36,21 @@ def urls_in_model(model):
     return urls
 
 
+def _evaluate_goods(page, script):
+    """登录/验证跳转会销毁旧 JS 上下文，交还主循环识别新页面。"""
+    try:
+        return page.evaluate(script)
+    except BrowserError as exc:
+        interrupted = any(text in str(exc) for text in (
+            "Execution context was destroyed", "Cannot find context with specified id"))
+        if interrupted and not page.is_closed():
+            return []
+        raise
+
+
 def read_live_goods(page, keyword=""):
     """从已经打开的搜索页里读商品。price 是页面上显示的价格，不是分为单位的原价。"""
-    rows = page.evaluate(
+    rows = _evaluate_goods(page,
         """() => {
             const data = window.rawData;
             const list = data && data.stores && data.stores.store && data.stores.store.data
@@ -72,7 +85,7 @@ def read_live_goods(page, keyword=""):
 
 def read_dom_goods(page, keyword=""):
     """接口现在是加密的。商品画在页面上，就从卡片里把编号、名字和价格读出来。"""
-    rows = page.evaluate(
+    rows = _evaluate_goods(page,
         """() => {
             function readCard(node) {
                 const fiberKey = Object.keys(node).find((key) => key.startsWith("__reactFiber"));

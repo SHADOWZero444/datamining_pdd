@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote
 from .constants import BASE
+from pdd.browser.mobile import scroll_input
 
 def search_url(keyword):
     return f"{BASE}search_result.html?search_key={quote(keyword)}&search_met=manual&source=index"
@@ -44,6 +45,7 @@ def loading_error_retry_button(page):
 
 def retry_delay(value, fallback):
     """Retry-After 支持秒数和 HTTP 日期，不提前重试。"""
+    value = str(value or "").strip()
     if value.isdigit():
         return max(fallback, int(value))
     try:
@@ -55,8 +57,8 @@ def retry_delay(value, fallback):
         return fallback
 
 
-def scroll_results(page):
-    """连续滚动中的一段；接近底部减速，到底后不再发送滚轮事件。"""
+def scroll_results(page, *, retry_bottom=False):
+    """连续滚动中的一段；接近底部减速，到底后不再发送滑动事件。"""
     target = page.evaluate("""() => {
         const root = document.scrollingElement || document.documentElement;
         const candidates = [...document.querySelectorAll('div, main, section')].filter(el => {
@@ -76,11 +78,11 @@ def scroll_results(page):
         return {x:Math.max(1, Math.min(innerWidth-2, rect.left+rect.width/2)),
                 y:Math.max(1, Math.min(innerHeight-2, rect.top+Math.min(rect.height, innerHeight)/2)),
                 step, at_bottom:remaining <= 2, settle_ms:Math.round(260 - 120 * ease),
-                top:el.scrollTop, height:el.scrollHeight, viewport:el.clientHeight};
+                top:el.scrollTop, height:el.scrollHeight, viewport:el.clientHeight, touch_height:innerHeight};
     }""")
-    if not target["at_bottom"]:
-        page.mouse.move(target["x"], target["y"])
-        page.mouse.wheel(0, target["step"])
+    distance = target["step"] if not target["at_bottom"] else (-120 if retry_bottom else 0)
+    if distance:
+        scroll_input(page, target["x"], target["y"], distance, target["touch_height"])
     return target
 
 
@@ -129,6 +131,12 @@ def response_summary(data, response):
     if isinstance(data, dict):
         summary["keys"] = list(data)[:20]
         summary["data_type"] = type(data.get("data")).__name__
+        payload = data.get("data") if isinstance(data.get("data"), dict) else data
+        if isinstance(payload.get("items"), list):
+            summary["item_count"] = len(payload["items"])
+        for key in ("has_more", "hasMore", "is_repeated"):
+            if isinstance(payload.get(key), bool):
+                summary[key] = payload[key]
         for key in ("error_code", "code", "success"):
             value = data.get(key)
             if isinstance(value, (int, bool)):

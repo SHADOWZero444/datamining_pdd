@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.request import urlopen
 
 from playwright.sync_api import sync_playwright
+from .mobile import configure_mobile_page
 
 _session_lock = threading.Lock()
 
@@ -87,8 +88,9 @@ def capture_session(root, cookie_file, should_stop=None, *, headless=True):
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             port = probe.getsockname()[1]
+        executable = browser_executable()
         arguments = [
-            str(browser_executable()), f"--remote-debugging-port={port}",
+            str(executable), f"--remote-debugging-port={port}",
             "--remote-debugging-address=127.0.0.1", f"--user-data-dir={profile}",
             "--no-first-run", "--no-default-browser-check", "--disable-background-mode",
         ]
@@ -115,8 +117,7 @@ def capture_session(root, cookie_file, should_stop=None, *, headless=True):
             context = browser.contexts[0]
             page = context.pages[0] if context.pages else context.new_page()
             page.set_default_timeout(2000)
-            if headless:
-                page.set_viewport_size({"width": 1000, "height": 760})
+            device_session = configure_mobile_page(page, edge=executable.name.casefold() == "msedge.exe")
             try:
                 import_cookies(context, Path(cookie_file), marker)
                 yield page
@@ -127,6 +128,7 @@ def capture_session(root, cookie_file, should_stop=None, *, headless=True):
                     # 用户关闭浏览器时保留磁盘上的上一份会话，不影响已保存商品。
                     pass
                 try:
+                    device_session.detach()
                     browser.close()
                 except Exception:
                     pass
