@@ -156,7 +156,7 @@ class AppHandler(LocalHandler):
             except RuntimeError as exc:
                 self.send_json({"ok": False, "message": str(exc)}, 400)
             return
-        if path != "/api/search":
+        if path not in ("/api/search", "/api/search/refresh"):
             self.send_error(404)
             return
         if not isinstance(payload.get("keyword"), str):
@@ -177,11 +177,11 @@ class AppHandler(LocalHandler):
             limit = int(raw_limit)
         filters = read_filters(payload)
         try:
-            jobs.start_job(keyword, limit, filters)
+            current = jobs.start_job(keyword, limit, filters, refresh=path.endswith("/refresh"))
         except RuntimeError as exc:
             self.send_json({"ok": False, "message": str(exc)}, 409)
             return
-        self.send_json({"ok": True, "keyword": keyword})
+        self.send_json({"ok": True, "keyword": keyword, "job": current})
 
     def capture_request_allowed(self):
         # 自定义头让外部网页必须先通过 CORS 预检；本站不开放跨域权限。

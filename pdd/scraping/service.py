@@ -7,14 +7,14 @@ from .target import CollectionTarget
 
 def run_search(keyword, limit=None, filters=None, cancel_event=None, progress=None,
                on_batch=None, diagnostics=None, on_intervention=None, browser_request=None,
-               resume_request=None, on_browser_ready=None, capture_view=None, existing_goods=None):
+               resume_request=None, on_browser_ready=None, capture_view=None, existing_goods=None, refresh=False):
     """给界面调用。keyword 是搜索词；limit 是历史符合条件商品与本次商品的累计目标。"""
     keyword = (keyword or "").strip()
     if not keyword:
         raise RuntimeError("搜索词不能为空")
     errors = []
     diagnostics = diagnostics if diagnostics is not None else {}
-    target = CollectionTarget(limit, existing_goods, filters)
+    target = CollectionTarget(limit, existing_goods, filters, refresh=refresh)
     diagnostics.update(target.snapshot())
     if target.reached and not (cancel_event and cancel_event.is_set()):
         message = f"已达到累计目标 {limit} 条，无需重复抓取"

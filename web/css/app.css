@@ -390,6 +390,8 @@ input[type="text"], input[type="number"] {
 }
 .seq, .price, .sales { font-variant-numeric: tabular-nums; white-space: nowrap; }
 .seq { width: 52px; }
+.update-flag { width: 4em; white-space: nowrap; color: var(--ink); }
+.update-flag.changed { color: var(--ok); font-weight: 650; }
 .shop { max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .price { font-size: 18px; font-weight: 650; }
 .detail {

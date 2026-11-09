@@ -1,4 +1,4 @@
-function createActionHandler({ state, api, render, renderStage, renderNav, renderCaptureBar, capturePanel, loadGoods, openTab, closeTab, viewOf, openOverviewFeature, askModal, openEntryMenu, openGroupMenu, moveKeywords, removeKeywords }) {
+function createActionHandler({ state, api, render, renderStage, renderNav, renderCaptureBar, capturePanel, loadGoods, openTab, closeTab, viewOf, updateResultPage, openOverviewFeature, askModal, openEntryMenu, openGroupMenu, moveKeywords, removeKeywords }) {
   async function handleClick(event) {
     const browserAction = event.target.closest("[data-capture-browser]");
     if (browserAction) {
@@ -79,6 +79,33 @@ function createActionHandler({ state, api, render, renderStage, renderNav, rende
         state.auth = { ...state.auth, status: "failed", message: exc.message };
       }
       render();
+      return;
+    }
+    const refreshButton = event.target.closest("[data-refresh-keyword]");
+    if (refreshButton) {
+      if (state.pendingRefresh || state.job.running || state.auth.running) return;
+      const keyword = refreshButton.dataset.refreshKeyword;
+      const updateVisiblePage = () => {
+        const tab = state.tabs.find((item) => item.id === state.active);
+        if (state.section === "tools" && tab?.kind === "search") updateResultPage(tab.keyword);
+      };
+      delete state.refreshErrors[keyword];
+      state.pendingRefresh = keyword;
+      updateVisiblePage();
+      try {
+        const data = await api("/api/search/refresh", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ keyword }),
+        });
+        state.job = data.job;
+        renderCaptureBar();
+      } catch (exc) {
+        state.refreshErrors[keyword] = exc.message;
+      } finally {
+        state.pendingRefresh = null;
+        updateVisiblePage();
+      }
       return;
     }
     if (event.target.closest("[data-stop-search]")) {

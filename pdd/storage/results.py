@@ -67,33 +67,45 @@ def storage_path(keyword):
     return (Path("data") / "searches" / f"{result_stem(keyword)}.jsonl").as_posix()
 
 
-def search_metadata(keyword):
+def search_metadata(keyword, *, recover_legacy_limit=False):
     defaults = {
         "keyword": keyword,
+        "limit": None,
         "filters": {"tags": [], "required_words": "", "banned": "", "price_min": None, "price_max": None},
         "storage_path": storage_path(keyword),
     }
     path = metadata_path(keyword)
-    if not path.exists():
-        return defaults
     try:
         saved = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return defaults
+        saved = {}
     if not isinstance(saved, dict):
-        return defaults
+        saved = {}
     if isinstance(saved.get("filters"), dict):
         defaults["filters"].update(saved["filters"])
+    limit = saved.get("limit")
+    if recover_legacy_limit and "limit" not in saved:
+        # 旧版只在最近一次任务的运行记录中保存数量目标。
+        run_path = result_path(keyword).with_suffix(".run.json")
+        try:
+            run = json.loads(run_path.read_text(encoding="utf-8"))
+            if isinstance(run, dict) and run.get("keyword") == keyword:
+                limit = run.get("limit")
+        except (OSError, ValueError):
+            pass
+    if type(limit) is int and 1 <= limit <= 10000:
+        defaults["limit"] = limit
     defaults["keyword"] = saved.get("keyword") or keyword
     return defaults
 
 
 @synchronized
-def save_search_metadata(keyword, filters):
+def save_search_metadata(keyword, filters, limit=None):
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     payload = {
         "keyword": keyword,
         "filters": filters,
+        "limit": limit,
         "storage_path": storage_path(keyword),
         "saved_at": int(time.time()),
     }
@@ -231,20 +243,34 @@ def list_keywords():
     return [{"keyword": name, "count": count} for name, count in found.items()]
 
 
+def product_values(row):
+    fields = ("title", "shop_name", "price", "sales", "image")
+    values = tuple(str(row.get(field, "") or "").strip() for field in fields)
+    return values, frozenset(row.get("badges") or [])
+
+
 @synchronized
-def merge_goods(keyword, new_rows):
+def merge_goods(keyword, new_rows, *, baseline=None, reset_updates=False):
     """新结果并进旧文件。没有新商品时不覆盖，避免一次失败把历史清掉。"""
     old = read_jsonl(result_path(keyword))
-    merged = {row.get("goods_id"): row for row in old if row.get("goods_id")}
+    merged = {str(row["goods_id"]): dict(row) for row in old if row.get("goods_id")}
+    if reset_updates:
+        for row in merged.values():
+            row["updated"] = False
     for row in new_rows:
         goods_id = row.get("goods_id")
         if not goods_id:
             continue
-        previous = merged.get(goods_id, {})
-        row["seq"] = previous.get("seq") or row.get("seq")
-        if not row.get("shop_name"):
-            row["shop_name"] = previous.get("shop_name") or ""
-        merged[goods_id] = {**previous, **row}
+        key = str(goods_id)
+        previous = merged.get(key, {})
+        # 接口和页面可能在不同批次才补齐字段，缺失值不能抹掉已知数据。
+        observed = row if baseline is None else {k: v for k, v in row.items() if v not in (None, "")}
+        item = {**previous, **observed, "goods_id": key, "seq": previous.get("seq") or row.get("seq")}
+        if not item.get("shop_name"):
+            item["shop_name"] = previous.get("shop_name") or ""
+        if baseline is not None:
+            item["updated"] = key in baseline and product_values(item) != baseline[key]
+        merged[key] = item
     rows = list(merged.values())
     changed = rows != old
     assigned_seq = ensure_seq(rows)

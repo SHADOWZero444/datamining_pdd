@@ -560,6 +560,70 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(third["removed"], ["2"])
         self.assertEqual(len(results.result_feed("测试", "expired")["goods"]), 2)
 
+    def test_refresh_compares_each_batch_with_start_and_resets_previous_flags(self):
+        term = "测试"
+        results.merge_goods(term, [
+            {**row(1), "sales": "已拼10件", "badges": ["black", "bybt"]},
+            {**row(2), "updated": True}, {**row(3), "updated": True},
+        ])
+        first = results.result_feed(term)
+        def fake_search(keyword, on_batch, **options):
+            self.assertTrue(options["refresh"])
+            batch = [row(1, "12"), {**row(2), "url": "https://example.org/new"}, row(4)]
+            on_batch(batch)
+            delta = results.result_feed(term, first["revision"])
+            self.assertTrue(delta["delta"])
+            self.assertEqual([r["updated"] for r in delta["goods"]], [True, False, False, False])
+            on_batch([{**row(1, "12"), "sales": "", "badges": ["bybt", "black"]}])
+            return batch, None, []
+        with patch.object(service, "run_search", side_effect=fake_search):
+            jobs.run_job(term, None, {}, threading.Event(), refresh=True)
+        saved = results.load_goods(term)
+        self.assertEqual([r["seq"] for r in saved], [1, 2, 3, 4])
+        self.assertEqual([r["updated"] for r in saved], [True, False, False, False])
+        self.assertEqual(saved[0]["sales"], "已拼10件")
+        self.assertIn("本轮更新 1 条，新增 1 条", jobs.job["message"])
+        with patch.object(service, "run_search", return_value=([row(1, "12")], None, [])):
+            jobs.run_job(term, None, {}, threading.Event(), refresh=True)
+        self.assertFalse(any(r["updated"] for r in results.load_goods(term)))
+
+    def test_refresh_failure_preserves_last_result_until_first_batch_commits(self):
+        term = "测试"
+        results.merge_goods(term, [{**row(1), "updated": True}, row(2)])
+        before = results.result_path(term).read_bytes()
+        with patch.object(service, "run_search", return_value=([], None, ["登录已失效"])):
+            jobs.run_job(term, None, {}, threading.Event(), refresh=True)
+        self.assertEqual(results.result_path(term).read_bytes(), before)
+        self.assertIn("保留原有数据和更新标记", jobs.job["message"])
+        def interrupt(keyword, on_batch, **kwargs):
+            on_batch([row(2, "13")])
+            raise RuntimeError("模拟更新中断")
+        with patch.object(service, "run_search", side_effect=interrupt):
+            jobs.run_job(term, None, {}, threading.Event(), refresh=True)
+        self.assertEqual([r["updated"] for r in results.load_goods(term)], [False, True])
+        self.assertEqual(jobs.job["status"], "partial")
+
+    def test_refresh_restores_legacy_settings_and_counts_this_run_only(self):
+        term = "测试"
+        old = [row(1), row(2)]
+        results.write_jsonl(results.result_path(term), old)
+        results.atomic_write(results.metadata_path(term), json.dumps({"keyword": term, "filters": {"price_max": 15}}))
+        results.atomic_write(results.result_path(term).with_suffix(".run.json"), json.dumps({"keyword": term, "limit": 2}))
+        with patch.object(jobs.threading, "Thread") as thread:
+            jobs.start_job(term, None, {}, refresh=True)
+            keyword, limit, filters, cancel, refresh = thread.call_args.kwargs["args"]
+            self.assertEqual((keyword, limit, filters["price_max"], refresh), (term, 2, 15, True))
+            with self.assertRaises(RuntimeError):
+                jobs.start_job(term, None, {}, refresh=True)
+        target = service.CollectionTarget(limit, old, filters, refresh=True)
+        self.assertFalse(target.reached)
+        self.assertTrue(target.accept(row(1)))
+        self.assertTrue(target.accept(row(1)))
+        self.assertFalse(target.accept(row(3, "20")))
+        self.assertTrue(target.accept(row(4)))
+        self.assertTrue(target.reached)
+        self.assertEqual(target.new_ids, {"4"})
+
     def test_atomic_write_failure_preserves_old_file(self):
         path = results.result_path("测试")
         results.write_jsonl(path, [row(1)])

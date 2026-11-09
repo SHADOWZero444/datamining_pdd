@@ -26,6 +26,8 @@ const state = {
   selected: [],
   goods: Object.create(null),
   revisions: Object.create(null),
+  pendingRefresh: null,
+  refreshErrors: Object.create(null),
   metadata: Object.create(null),
   views: Object.create(null),
   auth: { running: false, status: "idle", message: "正在读取登录状态…", configured: false, cookie: "" },
@@ -59,7 +61,7 @@ const { applyListTools, viewOf, describeConditions, sortedAndRangedRows, searchF
 const { renderCaptureBar } = createCaptureFeature({ state, capturePanel });
 const { topPage } = createPagesFeature({ state, TOP, EYE_ICON, esc, settingsPage });
 const handleClick = createActionHandler({ state, api, render, renderStage, renderNav, renderCaptureBar, capturePanel,
-  loadGoods, openTab, closeTab, viewOf, openOverviewFeature, askModal, openEntryMenu, openGroupMenu, moveKeywords, removeKeywords });
+  loadGoods, openTab, closeTab, viewOf, updateResultPage, openOverviewFeature, askModal, openEntryMenu, openGroupMenu, moveKeywords, removeKeywords });
 const handleSubmit = createFormHandler({ state, api, render, applyListTools, viewOf, sortedAndRangedRows, renderStage, loadGoods, openTab });
 document.body.addEventListener("click", (event) => handleClick(event).catch(showActionError));
 document.body.addEventListener("submit", (event) => handleSubmit(event).catch(showActionError));
@@ -138,7 +140,9 @@ async function refresh() {
   try {
   const active = state.active;
   const section = state.section;
+  const priorJob = state.job;
   const data = await api("/api/state");
+  if (priorJob !== state.job) return;
   const jobChanged = JSON.stringify(data.job) !== JSON.stringify(state.job);
   const keywordsChanged = JSON.stringify(data.keywords) !== JSON.stringify(state.keywords);
   const libraryChanged = JSON.stringify(data.library) !== JSON.stringify(state.library);
@@ -158,7 +162,8 @@ async function refresh() {
   renderCaptureBar();
   if (keywordsChanged || libraryChanged) renderNav();
   if (state.active !== active || state.section !== section) return;
-  if (tab?.kind === "search" && state.section === "tools" && (jobChanged || goodsChanged)) {
+  if (tab?.kind === "search" && state.section === "tools" &&
+      (jobChanged || goodsChanged || authChanged || $("stage").querySelector(".catalog tbody[data-deferred]"))) {
     updateResultPage(tab.keyword);
   } else if (tab?.kind === "goods" && state.section === "tools" && (goodsChanged || jobChanged)) {
     if (!$("stage").contains(document.activeElement) && !window.getSelection()?.toString()) renderStage();

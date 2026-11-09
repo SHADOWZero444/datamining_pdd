@@ -360,7 +360,7 @@ def collect(page, limit=None, should_stop=None, progress=None, filters=None,
             if time.monotonic() >= cooldown_until:
                 report()
             if target.reached:
-                finish("limit", f"已达到累计目标 {target.limit} 条")
+                finish("limit", f"本轮已核对 {target.limit} 条" if target.refresh else f"已达到累计目标 {target.limit} 条")
                 break
             phase = "page_state"
             state = page_state(page)

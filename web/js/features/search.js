@@ -50,6 +50,7 @@ function createSearchFeature({ state, preferences, TAGS, badgeText, esc, money, 
     const field = sort.field;
     const factor = sort.direction === "asc" ? 1 : -1;
     return visible.sort((a, b) => {
+      if (field === "updated") return factor * (Number(a.updated === true) - Number(b.updated === true));
       const aValue = field === "title" || field === "shop_name" ? String(a[field] || "") : numericValue(a[field]);
       const bValue = field === "title" || field === "shop_name" ? String(b[field] || "") : numericValue(b[field]);
       if (typeof aValue === "string") return factor * aValue.localeCompare(bValue, "zh-CN");
@@ -115,11 +116,18 @@ function createSearchFeature({ state, preferences, TAGS, badgeText, esc, money, 
     view.page = Math.min(Math.max(1, view.page), pageCount);
     const pageRows = visibleRows.slice((view.page - 1) * view.pageSize, view.page * view.pageSize);
     const running = state.job.running && state.job.keyword === keyword;
-    const sortHeader = (field, label) => {
+    const pending = state.pendingRefresh === keyword;
+    const busy = Boolean(state.pendingRefresh || state.job.running || state.auth.running);
+    let status = `已保存 ${rows.length} 条`;
+    if (state.job.keyword === keyword && state.job.message) status = state.job.message;
+    if (!running && busy) status = state.auth.running ? "登录完成后即可更新。" : "当前抓取结束后即可更新。";
+    if (!running && state.refreshErrors[keyword]) status = state.refreshErrors[keyword];
+    if (pending) status = "正在启动更新…";
+    const sortHeader = (field, label, hint = "") => {
       const sort = view.sort;
       const direction = sort?.field === field ? sort.direction : null;
       const indicator = direction === "asc" ? "升序" : direction === "desc" ? "降序" : "未排序";
-      return `<th aria-sort="${direction === "asc" ? "ascending" : direction === "desc" ? "descending" : "none"}"><button class="table-sort" type="button" data-sort-keyword="${esc(keyword)}" data-sort-field="${field}">${label}<span aria-hidden="true" class="sort-mark ${direction || ""}"></span><span class="sr-only">${indicator}</span></button></th>`;
+      return `<th scope="col"${hint ? ` title="${esc(hint)}"` : ""} aria-sort="${direction === "asc" ? "ascending" : direction === "desc" ? "descending" : "none"}"><button class="table-sort" type="button" data-sort-keyword="${esc(keyword)}" data-sort-field="${field}">${label}<span aria-hidden="true" class="sort-mark ${direction || ""}"></span><span class="sr-only">${indicator}</span></button></th>`;
     };
     const body = pageRows.length ? pageRows.map((item) => `
       <tr data-open-goods="${esc(item.goods_id)}" data-keyword="${esc(keyword)}">
@@ -132,17 +140,19 @@ function createSearchFeature({ state, preferences, TAGS, badgeText, esc, money, 
         <td class="shop">${esc(item.shop_name || "未知")}</td>
         <td class="price">${esc(money(item.price))}</td>
         <td class="sales">${esc(item.sales || "—")}</td>
+        <td class="update-flag${item.updated === true ? " changed" : ""}">${item.updated === true ? "是" : "否"}</td>
       </tr>
-    `).join("") : `<tr><td colspan="6"><p class="empty">${running ? "正在抓取，结果会陆续出现在这里。" : rows.length ? "没有符合当前序号范围的商品。" : "还没有符合条件的商品。"}</p></td></tr>`;
+    `).join("") : `<tr><td colspan="7"><p class="empty">${running ? "正在抓取，结果会陆续出现在这里。" : rows.length ? "没有符合当前序号范围的商品。" : "还没有符合条件的商品。"}</p></td></tr>`;
     return `
       <div class="result-head">
         <div>
           <h1 class="page-title">${esc(entryOf(keyword)?.title || keyword)}</h1>
           <p class="conditions">${esc(describeConditions(keyword))}</p>
           <p class="storage-note">本次数据保存位置：<code>${esc(metadata.storage_path || `data/searches/${keyword}.jsonl`)}</code></p>
-          <p class="lede result-status" role="status">${esc(state.job.keyword === keyword ? (state.job.message || `已保存 ${rows.length} 条`) : `已保存 ${rows.length} 条`)}</p>
+          <p class="lede result-status" role="status">${esc(status)}</p>
           <div class="result-actions">
-            <button class="ghost" type="button" data-delete-keyword="${esc(keyword)}" ${running ? 'disabled title="请先停止抓取"' : ''}>删除这个词条</button>
+            <button class="start" type="button" data-refresh-keyword="${esc(keyword)}" ${busy ? "disabled" : ""}>${pending ? "正在启动…" : running ? (state.job.refresh ? "正在更新…" : "正在抓取…") : "更新数据"}</button>
+            <button class="ghost" type="button" data-delete-keyword="${esc(keyword)}" ${running || pending ? 'disabled title="请先停止抓取"' : ''}>删除这个词条</button>
           </div>
         </div>
       </div>
@@ -156,7 +166,7 @@ function createSearchFeature({ state, preferences, TAGS, badgeText, esc, money, 
         <p class="table-count">显示 ${pageRows.length ? (view.page - 1) * view.pageSize + 1 : 0}–${Math.min(view.page * view.pageSize, visibleRows.length)} / ${visibleRows.length} 条${visibleRows.length !== rows.length ? `（共 ${rows.length} 条）` : ""}</p>
       </section>
       <div class="catalog-scroll" role="region" aria-label="商品列表，可横向滚动" tabindex="0"><table class="catalog">
-        <thead><tr>${sortHeader("seq", "ID")}<th>图片</th>${sortHeader("title", "商品")}${sortHeader("shop_name", "店名")}${sortHeader("price", "价格")}${sortHeader("sales", "销量")}</tr></thead>
+        <thead><tr>${sortHeader("seq", "ID")}<th>图片</th>${sortHeader("title", "商品")}${sortHeader("shop_name", "店名")}${sortHeader("price", "价格")}${sortHeader("sales", "销量")}${sortHeader("updated", "更新", "本轮更新中，已有商品的内容是否发生变化")}</tr></thead>
         <tbody>${body}</tbody>
       </table></div>
       <nav class="pagination" aria-label="商品列表翻页"><button class="ghost" type="button" data-page-step="prev" data-page-keyword="${esc(keyword)}" ${view.page === 1 ? "disabled" : ""}>上一页</button><form class="page-jump" data-page-form="${esc(keyword)}"><label for="page-number-${esc(keyword)}">第</label><input id="page-number-${esc(keyword)}" name="page" type="number" min="1" max="${pageCount}" step="1" inputmode="numeric" value="${view.page}"><span>/ ${pageCount} 页</span><button class="ghost" type="submit">跳转</button></form><button class="ghost" type="button" data-page-step="next" data-page-keyword="${esc(keyword)}" ${view.page === pageCount ? "disabled" : ""}>下一页</button></nav>`;
@@ -193,14 +203,30 @@ function createSearchFeature({ state, preferences, TAGS, badgeText, esc, money, 
     const template = document.createElement("template");
     template.innerHTML = resultPage(keyword);
     const scrollTop = stage.scrollTop;
-    for (const selector of [".conditions", ".result-status", ".result-actions", ".table-count", ".catalog tbody"]) {
+    for (const selector of ["[data-refresh-keyword]", "[data-delete-keyword]"]) {
+      const current = stage.querySelector(selector);
+      const next = template.content.querySelector(selector);
+      if (current && next) {
+        current.disabled = next.disabled;
+        current.title = next.title;
+        if (current.textContent !== next.textContent) current.textContent = next.textContent;
+      }
+    }
+    for (const selector of [".conditions", ".result-status", ".table-count", ".catalog tbody"]) {
       const current = stage.querySelector(selector);
       const next = template.content.querySelector(selector);
       if (current && next && current.innerHTML !== next.innerHTML) {
-        // 正在选择或查看的行维持位置；新商品仍已进入本地数据，翻页即可查看。
-        if (selector === ".catalog tbody" && (current.contains(document.activeElement) || window.getSelection()?.toString())) continue;
+        // 选择商品文字时暂缓替换，选择结束后即使没有新批次也会补上。
+        if (selector === ".catalog tbody") {
+          const selection = window.getSelection();
+          if (current.contains(document.activeElement) || (selection && !selection.isCollapsed && selection.containsNode(current, true))) {
+            current.dataset.deferred = "";
+            continue;
+          }
+        }
         current.innerHTML = next.innerHTML;
       }
+      if (current) delete current.dataset.deferred;
     }
     const pagination = stage.querySelector(".pagination");
     const nextPagination = template.content.querySelector(".pagination");

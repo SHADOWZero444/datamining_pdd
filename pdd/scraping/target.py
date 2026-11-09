@@ -3,13 +3,15 @@ from .filters import apply_filters
 
 
 class CollectionTarget:
-    def __init__(self, limit=None, existing_goods=None, filters=None):
+    def __init__(self, limit=None, existing_goods=None, filters=None, refresh=False):
         rows = [row for row in (existing_goods or []) if row.get("goods_id")]
         self.limit = limit
         self.filters = filters
         self.known_ids = {str(row["goods_id"]) for row in rows}
-        self.matched_ids = {str(row["goods_id"]) for row in apply_filters(rows, filters)}
-        self.existing_matched = len(self.matched_ids)
+        self.refresh = refresh
+        old_matches = {str(row["goods_id"]) for row in apply_filters(rows, filters)}
+        self.existing_matched = len(old_matches)
+        self.matched_ids = set() if refresh else old_matches
         self.new_ids = set()
 
     @property
@@ -37,4 +39,6 @@ class CollectionTarget:
 
     def description(self):
         target = f"/{self.limit}" if self.limit is not None else ""
+        if self.refresh:
+            return f"本轮已核对 {self.count}{target} 条，本次新增 {len(self.new_ids)} 条"
         return f"累计符合条件 {self.count}{target} 条，本次新增 {len(self.new_ids)} 条"

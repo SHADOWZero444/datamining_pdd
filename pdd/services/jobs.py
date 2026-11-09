@@ -4,6 +4,7 @@ import threading
 import time
 from pdd.browser.view import CaptureView
 from pdd.storage import results, library
+from pdd.scraping.filters import read_filters
 from . import auth as auth_service
 from uuid import uuid4
 
@@ -22,7 +23,7 @@ job_browser_request = None
 job_resume_request = None
 job_capture_view = None
 
-def run_job(keyword, limit, filters, cancel_event):
+def run_job(keyword, limit, filters, cancel_event, refresh=False):
     started_at = time.monotonic()
     diagnostics = {}
     capture_view = job_capture_view
@@ -31,6 +32,9 @@ def run_job(keyword, limit, filters, cancel_event):
 
         existing_goods = results.read_jsonl(results.result_path(keyword))
         existing_ids = {str(row["goods_id"]) for row in existing_goods if row.get("goods_id")}
+        baseline = {str(row["goods_id"]): results.product_values(row) for row in existing_goods
+                    if row.get("goods_id")} if refresh else None
+        batch_saved = False
         with job_lock:
             job["saved"] = len(existing_goods)
 
@@ -41,10 +45,13 @@ def run_job(keyword, limit, filters, cancel_event):
                                 "scanned": diagnostics.get("scanned", 0)})
 
         def save_batch(rows):
-            with results.data_lock:
-                saved = results.merge_goods(keyword, rows)
+            nonlocal batch_saved
+            saved = results.merge_goods(keyword, rows, baseline=baseline,
+                                        reset_updates=refresh and not batch_saved)
+            batch_saved = True
             with job_lock:
                 job["saved"] = len(saved)
+            return saved
 
         def report_intervention(status, message, kind):
             with job_lock:
@@ -60,6 +67,7 @@ def run_job(keyword, limit, filters, cancel_event):
             limit=limit,
             filters=filters,
             existing_goods=existing_goods,
+            refresh=refresh,
             cancel_event=cancel_event,
             progress=report_progress,
             on_batch=save_batch,
@@ -70,11 +78,27 @@ def run_job(keyword, limit, filters, cancel_event):
             on_browser_ready=browser_ready,
             capture_view=capture_view,
         )
-        saved = results.merge_goods(keyword, goods) if goods else results.read_jsonl(results.result_path(keyword))
+        stopped = cancel_event.is_set()
+        if goods or (refresh and not errors and not stopped):
+            saved = save_batch(goods)
+        else:
+            saved = results.read_jsonl(results.result_path(keyword))
         new_count = len({str(row["goods_id"]) for row in saved if row.get("goods_id")} - existing_ids)
         diagnostics["saved_new_goods"] = new_count
-        stopped = cancel_event.is_set()
-        if stopped:
+        if refresh:
+            updated_count = sum(row.get("updated") is True for row in saved) if batch_saved else 0
+            diagnostics["updated_goods"] = updated_count
+            if stopped:
+                status, reason = "stopped", "已停止更新"
+            elif errors:
+                status, reason = ("partial" if saved else "failed"), errors[-1]
+            else:
+                status, reason = "ok", "更新完成"
+            if batch_saved:
+                message = f"{reason}。本轮更新 {updated_count} 条，新增 {new_count} 条，共保存 {len(saved)} 条"
+            else:
+                message = f"{reason}。本轮未写入结果，保留原有数据和更新标记。"
+        elif stopped:
             message = f"已停止抓取，已保留 {len(saved)} 条商品"
             status = "stopped"
         elif diagnostics.get("stop_reason") == "limit" and not errors:
@@ -90,7 +114,7 @@ def run_job(keyword, limit, filters, cancel_event):
         else:
             message = errors[-1] if errors else "没有抓到商品"
             status = "failed"
-        if limit is not None and not stopped and diagnostics.get("cumulative_matched", 0) < limit:
+        if not refresh and limit is not None and not stopped and diagnostics.get("cumulative_matched", 0) < limit:
             if saved:
                 status = "partial"
             message += f"。累计符合条件 {diagnostics.get('cumulative_matched', 0)}/{limit} 条，目标尚未完成"
@@ -133,7 +157,7 @@ def run_job(keyword, limit, filters, cancel_event):
                 job["running"] = False
 
 
-def start_job(keyword, limit, filters):
+def start_job(keyword, limit, filters, *, refresh=False):
     """初始化失败不占用任务槽；持锁完成状态发布与线程启动。"""
     global job_cancel, job_browser_request, job_resume_request, job_capture_view
     with job_lock, auth_service.auth_lock:
@@ -141,17 +165,24 @@ def start_job(keyword, limit, filters):
             raise RuntimeError("请先完成当前登录，再开始抓取。")
         if job["running"]:
             raise RuntimeError("已有抓取在进行，请等它结束。")
-        results.save_search_metadata(keyword, filters)
+        if refresh:
+            if not (results.result_path(keyword).exists() or results.metadata_path(keyword).exists()):
+                raise RuntimeError("这个词条已不存在，请重新搜索。")
+            metadata = results.search_metadata(keyword, recover_legacy_limit=True)
+            limit = metadata["limit"]
+            filters = read_filters(metadata["filters"])
+        results.save_search_metadata(keyword, filters, limit)
         library.ensure_library_entry(keyword)
         job_cancel = threading.Event()
         job_browser_request = threading.Event()
         job_resume_request = threading.Event()
         job_capture_view = CaptureView()
-        job.update(running=True, keyword=keyword, status="running", message="正在打开搜索页",
+        job.update(running=True, refresh=refresh, keyword=keyword, status="running", message="正在打开搜索页",
                    count=0, total=None, scanned=0, saved=0, stop_reason=None,
                    id=uuid4().hex, browser_available=False, intervention_kind=None)
         try:
-            threading.Thread(target=run_job, args=(keyword, limit, filters, job_cancel), daemon=False).start()
+            threading.Thread(target=run_job, args=(keyword, limit, filters, job_cancel, refresh), daemon=False).start()
         except Exception:
             job.update(running=False, status="failed", message="无法启动抓取，请重试。")
             raise
+        return dict(job)
