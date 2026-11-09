@@ -59,12 +59,11 @@ def main():
                 box = page.frame_locator("iframe").get_by_role("button", name="测试验证通过").bounding_box()
                 view.open()
                 view.submit({"action": "pointer", "points": [[(box['x'] + 10) / 390, (box['y'] + 10) / 844, 0]]})
-        with patch.object(capture_verification, "AUTO_WAIT_SECONDS", .4), \
-             patch.object(capture_verification, "MANUAL_WAIT_SECONDS", 8):
+        with patch.object(capture_verification, "MANUAL_WAIT_SECONDS", 8):
             goods, _ = scraper.collect(page, limit=40, on_batch=batches.append,
                                        on_intervention=intervene, diagnostics=stats, capture_view=view)
         assert len(goods) == 40, stats
-        assert notifications == ["recovering", "verification", "running"], notifications
+        assert notifications == ["verification", "running"], notifications
         assert len({g["goods_id"] for g in goods}) == 40
         assert not view.opened.is_set()
         page.evaluate("document.body.insertAdjacentHTML('beforeend','<iframe style=\"display:none\" src=\"/captcha.html\"></iframe>')")

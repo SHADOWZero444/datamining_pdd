@@ -67,7 +67,7 @@ class CaptureViewTests(unittest.TestCase):
                 self.assertEqual(request(headers=headers, path="/api/search/browser/frame?job_id=fixture-current")[0], 200)
                 self.assertEqual(request({**payload, "action": "resume"}, headers)[0], 200)
                 self.assertTrue(resume.is_set())
-                self.assertFalse(view.opened.is_set())
+                self.assertTrue(view.opened.is_set())  # 点击继续不应丢弃未完成的验证界面。
                 current["running"] = False
                 self.assertEqual(request(payload, headers)[0], 409)
             finally:

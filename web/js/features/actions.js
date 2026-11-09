@@ -12,7 +12,7 @@ function createActionHandler({ state, api, render, renderStage, renderNav, rende
           body: JSON.stringify({ action, job_id: jobId }),
         });
         if (action === "open" && state.job.id === jobId) capturePanel.show(jobId);
-        if (action === "resume") capturePanel.hide(false);
+        // 验证是否结束由后台确认；仍需操作时保留当前画面。
       } catch (exc) {
         state.job.message = exc.message;
       } finally {

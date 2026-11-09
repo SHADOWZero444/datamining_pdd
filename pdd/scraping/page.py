@@ -57,33 +57,55 @@ def retry_delay(value, fallback):
         return fallback
 
 
-def scroll_results(page, *, retry_bottom=False):
-    """连续滚动中的一段；接近底部减速，到底后不再发送滑动事件。"""
-    target = page.evaluate("""() => {
+def scroll_results(page, *, retry_bottom=False, can_scroll=None, previous=None):
+    """在可见页面命中的滚动容器内滑动；连续未移动才使用原生容器滚动。"""
+    handle = page.evaluate_handle("""() => {
         const root = document.scrollingElement || document.documentElement;
-        const candidates = [...document.querySelectorAll('div, main, section')].filter(el => {
-            const style = getComputedStyle(el);
-            return /(auto|scroll)/.test(style.overflowY) && el.clientHeight > 200 &&
-                el.scrollHeight > el.clientHeight && el.getBoundingClientRect().width > 200 &&
-                el.getBoundingClientRect().bottom > 0 && el.getBoundingClientRect().top < innerHeight;
-        });
-        const el = candidates.sort((a, b) =>
-            b.querySelectorAll('img').length - a.querySelectorAll('img').length || b.clientHeight - a.clientHeight)[0] || root;
-        const rect = el === root ? {left:0, top:0, width:innerWidth, height:innerHeight} : el.getBoundingClientRect();
+        // 命中测试排除隐藏副本和遮挡层；从触点向上找实际接收滑动的祖先。
+        const hits = new Map();
+        for (const fy of [.55, .72, .38, .85]) for (const fx of [.5, .32, .68]) {
+            const x = innerWidth * fx, y = innerHeight * fy;
+            let node = document.elementFromPoint(x, y);
+            while (node) {
+                if (node.clientHeight >= 160 && node.clientWidth >= 180 &&
+                    node.scrollHeight > node.clientHeight + 2 &&
+                    (node === root || /auto|scroll|overlay/.test(getComputedStyle(node).overflowY))) {
+                    const hit = hits.get(node) || {el:node, x, y, count:0};
+                    hit.count++; hits.set(node, hit); break;
+                }
+                node = node.parentElement;
+            }
+        }
+        const {el,x,y} = [...hits.values()].sort((a,b) =>
+            b.count-a.count || Number(!!b.el.querySelector('img')) - Number(!!a.el.querySelector('img'))
+        )[0] || {el:root,x:innerWidth/2,y:innerHeight/2};
         const remaining = Math.max(0, el.scrollHeight - el.clientHeight - el.scrollTop);
         const viewport = Math.min(el.clientHeight, innerHeight);
         const ratio = Math.min(1, remaining / Math.max(1, viewport * 2));
         const ease = ratio * ratio * (3 - 2 * ratio);
         const step = Math.min(remaining, Math.max(80, viewport * (.35 + .5 * ease)));
-        return {x:Math.max(1, Math.min(innerWidth-2, rect.left+rect.width/2)),
-                y:Math.max(1, Math.min(innerHeight-2, rect.top+Math.min(rect.height, innerHeight)/2)),
+        return {el, metrics:{x, y,
                 step, at_bottom:remaining <= 2, settle_ms:Math.round(260 - 120 * ease),
-                top:el.scrollTop, height:el.scrollHeight, viewport:el.clientHeight, touch_height:innerHeight};
+                top:el.scrollTop, height:el.scrollHeight, viewport:el.clientHeight, touch_height:innerHeight}};
     }""")
-    distance = target["step"] if not target["at_bottom"] else (-120 if retry_bottom else 0)
-    if distance:
-        scroll_input(page, target["x"], target["y"], distance, target["touch_height"])
-    return target
+    try:
+        target = handle.evaluate("t => t.metrics")
+        distance = target["step"] if not target["at_bottom"] else (-120 if retry_bottom else 0)
+        prior = previous or {}
+        unchanged = (prior.get("strategy") in ("gesture", "container") and
+                     abs(prior["top"] - target["top"]) < 2 and prior["viewport"] == target["viewport"])
+        target["unmoved"] = prior.get("unmoved", 0) + 1 if unchanged else 0
+        target["strategy"] = "idle"
+        if distance and (can_scroll is None or can_scroll()):
+            if target["unmoved"] >= 2 and distance > 0:
+                target["strategy"] = "container"
+                target["after_top"] = handle.evaluate("(t, dy) => { t.el.scrollTop += dy; return t.el.scrollTop; }", distance)
+            else:
+                target["strategy"] = "gesture"
+                scroll_input(page, target["x"], target["y"], distance, target["touch_height"])
+        return target
+    finally:
+        handle.dispose()
 
 
 def page_state(page):

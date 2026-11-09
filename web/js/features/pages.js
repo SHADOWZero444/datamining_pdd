@@ -11,6 +11,9 @@ function createPagesFeature({ state, TOP, EYE_ICON, esc, settingsPage }) {
           <p class="help">请仅使用自己的账号。Cookie 是登录凭证，请勿发送给他人。</p>
           <p class="auth-status ${auth.status === "failed" ? "error" : ""}" role="status">${esc(auth.message || (auth.configured ? "已设置登录信息。" : "尚未设置登录信息请点击确认以开始。"))}</p>
           <div class="login-actions"><button class="start" type="submit">确认</button><button class="ghost" type="button" data-clear-cookie>清除</button><button class="ghost" type="button" data-login-cookie ${auth.running ? "disabled" : ""}>${auth.running ? "等待登录…" : "前往获取"}</button></div>
+          <div class="help-text">
+            <p>目标网站：https://mobile.pinduoduo.com/</p>
+          </div>
         </form>
       </section>`;
     }

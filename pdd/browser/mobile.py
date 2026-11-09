@@ -26,7 +26,43 @@ def configure_mobile_page(page, *, edge=True):
     })
     session.send("Emulation.setTouchEmulationEnabled", {"enabled": True, "maxTouchPoints": 5})
     page._pdd_touch_session = session
+    page._pdd_edge = edge
     return session
+
+
+def manual_pointer(page, points, active):
+    """把用户实际输入的位置和间隔送给手机页面；不生成或猜测验证轨迹。"""
+    size = page.viewport_size or page.evaluate("({width:innerWidth,height:innerHeight})")
+    touch = getattr(page, "_pdd_touch_session", None)
+    def coords(point):
+        return {"x": point[0] * (size["width"] - 1), "y": point[1] * (size["height"] - 1)}
+    def dispatch(kind, positions):
+        touch.send("Input.dispatchTouchEvent", {"type": kind, "touchPoints": positions})
+    if not active():
+        return
+    if touch:
+        dispatch("touchStart", [coords(points[0])])
+    else:
+        page.mouse.move(**coords(points[0]))
+        page.mouse.down()
+    completed = False
+    try:
+        for point in points[1:]:
+            if not active():
+                return
+            page.wait_for_timeout(point[2])
+            if not active():
+                return
+            if touch:
+                dispatch("touchMove", [coords(point)])
+            else:
+                page.mouse.move(**coords(point))
+        completed = active()
+    finally:
+        if touch:
+            dispatch("touchEnd" if completed else "touchCancel", [])
+        else:
+            page.mouse.up()
 
 
 def scroll_input(page, x, y, distance, viewport_height):

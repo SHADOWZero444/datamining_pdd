@@ -46,6 +46,7 @@ const capturePanel = (() => {
       });
       if (version !== generation || !dialog.open) return;
       if (!frame.opened) { hide(false); return; }
+      if (!frame.image && frame.error) image.hidden = true;
       if (frame.image && !points) {
         image.src = `data:image/jpeg;base64,${frame.image}`;
         if (!image.isConnected) document.getElementById("capture-screen").append(image);

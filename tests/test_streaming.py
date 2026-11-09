@@ -15,6 +15,8 @@ from pdd.services import auth as auth_service, jobs
 from pdd.scraping import filters as filter_tools, service
 from pdd.scraping import collector as scraper
 from pdd.scraping import page as page_tools
+from pdd.browser.view import CaptureView
+from pdd.scraping.pacing import PagePacer
 
 
 def row(n, price="10"):
@@ -44,6 +46,9 @@ class FakePage:
 
     def on(self, event, callback):
         self.callbacks[event] = callback
+
+    def is_closed(self):
+        return False
 
     def remove_listener(self, event, callback):
         self.callbacks.pop(event, None)
@@ -143,7 +148,7 @@ class CollectorTests(unittest.TestCase):
         stats, intervention = {}, Mock()
         goods, _ = self.collect(FakePage([[row(1)]]), diagnostics=stats,
                                 page_state="busy", on_intervention=intervention)
-        self.assertEqual(stats["stop_reason"], "site_busy")
+        self.assertEqual(stats["stop_reason"], "rate_limited")
         self.assertEqual(len(goods), 1)
         intervention.assert_not_called()
 
@@ -167,6 +172,21 @@ class CollectorTests(unittest.TestCase):
         goods, _ = self.collect(FakePage([[row(1)]], fail_at=1), on_batch=batches.append, diagnostics=stats)
         self.assertEqual(goods, batches[0])
         self.assertEqual(stats["stop_reason"], "error")
+
+    def test_desktop_repeated_rejections_require_manual_confirmation(self):
+        resume, stats, ready_at = threading.Event(), {}, []
+        page = FakePage([[row(1)]] * 4 + [[row(1), row(2)]],
+                        {i: [Response(status=429)] for i in range(4)})
+        def notify(status, message, kind):
+            if kind == "rate_limit_ready":
+                ready_at.append(page.clock)
+                resume.set()
+        goods, _ = self.collect(page, limit=2, diagnostics=stats,
+                                resume_request=resume, on_intervention=notify)
+        self.assertEqual(len(goods), 2)
+        self.assertEqual(stats["auto_recovery_attempts"], 3)
+        self.assertEqual(stats["manual_resumes"], 1)
+        self.assertGreaterEqual(ready_at[0] + .001, 60 + 120 + 240 + 480)
 
     def test_unreadable_response_still_uses_rendered_goods(self):
         response, stats = Response(), {}
@@ -198,11 +218,11 @@ class CollectorTests(unittest.TestCase):
         page.wait_hook = complete
         goods, _ = self.collect(page, limit=2)
         self.assertEqual(len(goods), 2)
-        self.assertGreaterEqual(page.first_scroll, 3 + scraper.MIN_PAGE_INTERVAL)
+        self.assertGreaterEqual(page.first_scroll + .001, 3 + PagePacer.RENDER_SETTLE)
         self.assertFalse(page.callbacks)
 
     def test_user_takeover_pauses_scroll_and_remains_cancellable(self):
-        view = app.CaptureView()
+        view = CaptureView()
         view.open()
         page = FakePage([[row(1)]])
         cancelled = threading.Event()
@@ -277,9 +297,10 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(stats["consecutive_rate_limits"], 0)
         self.assertEqual(stats["rate_limit_retries"], 4)
         self.assertEqual(stats["page_retries"], 0)
-        self.assertEqual(stats["page_interval_seconds"], scraper.MAX_PAGE_INTERVAL)
+        self.assertEqual(stats["auto_recovery_attempts"], 4)
+        self.assertGreater(stats["page_interval_seconds"], PagePacer.MIN_INTERVAL)
         for (before, status), (after, _) in zip(page.requests, page.requests[1:]):
-            self.assertGreaterEqual(after - before + .001, 45 if status == 429 else scraper.MIN_PAGE_INTERVAL)
+            self.assertGreaterEqual(after - before + .001, 60 if status == 429 else PagePacer.MIN_INTERVAL)
         self.assertEqual(len(stats["response_timeline"]), 60)
         self.assertFalse(page.callbacks)
 
@@ -292,7 +313,9 @@ class CollectorTests(unittest.TestCase):
         goods, _ = self.collect(FakePage([[row(1)]], responses), diagnostics=stats)
         self.assertEqual(len(goods), 1)
         self.assertEqual(stats["stop_reason"], "rate_limited")
-        self.assertEqual(stats["consecutive_rate_limits"], 4)
+        # 首次恢复返回重复页，不能再自动滚动触发后续请求。
+        self.assertEqual(stats["consecutive_rate_limits"], 1)
+        self.assertEqual(stats["api_responses"], 3)
         self.assertEqual(stats["rate_limit_recoveries"], 0)
 
     def test_successful_encrypted_page_and_new_dom_rows_reset_budget(self):
@@ -379,7 +402,7 @@ class CollectorTests(unittest.TestCase):
         button.click.side_effect = clicked
         with patch.object(scraper, "loading_error_retry_button", return_value=button):
             self.collect(page, should_stop=cancelled.is_set)
-        self.assertGreaterEqual(clicked_at[0], finished_at[0] + scraper.MAX_PAGE_INTERVAL - .001)
+        self.assertGreaterEqual(clicked_at[0], max(60, finished_at[0] + PagePacer.RENDER_SETTLE) - .001)
 
     def test_verification_during_cooldown_does_not_click_retry(self):
         page = FakePage([[row(1)]], {0: [Response(status=429)]})
@@ -428,7 +451,7 @@ class CollectorTests(unittest.TestCase):
 
     def test_user_takeover_during_cooldown_never_clicks_retry(self):
         page = FakePage([[row(1)]], {0: [Response(status=429)]})
-        view, button, stats = app.CaptureView(), Mock(), {}
+        view, button, stats = CaptureView(), Mock(), {}
         cancelled = threading.Event()
         def take_over():
             view.open()
@@ -443,6 +466,27 @@ class CollectorTests(unittest.TestCase):
 
 
 class PageRecoveryTests(unittest.TestCase):
+    def test_window_blocks_seventh_request_and_drains_after_idle(self):
+        with patch("pdd.scraping.pacing.time.monotonic", return_value=0) as clock:
+            pacer = PagePacer()
+            for start in (0, 3, 6, 9, 12, 15):
+                pacer.started(start)
+                pacer.finished(start, start + 0.1)
+            clock.return_value = 59.9
+            self.assertFalse(pacer.ready())
+            clock.return_value = 60
+            self.assertTrue(pacer.ready())
+            pacer.started(60)
+            clock.return_value = 121
+            self.assertTrue(pacer.ready())
+
+    def test_rate_limit_spacing_does_not_reset_after_one_success(self):
+        pacer = PagePacer()
+        pacer.slow_down()
+        for _ in range(100):
+            pacer.new_page()
+        self.assertGreaterEqual(pacer.interval, pacer.WINDOW_SECONDS / pacer.WINDOW_REQUESTS)
+
     def test_retry_after_formats(self):
         from datetime import datetime, timezone
         now = datetime(2026, 10, 31, tzinfo=timezone.utc)
@@ -456,12 +500,24 @@ class PageRecoveryTests(unittest.TestCase):
 
     def test_only_explicit_recovery_leaves_bottom(self):
         page = Mock()
-        page.evaluate.return_value = {"x": 100, "y": 200, "at_bottom": True, "step": 0}
+        page._pdd_touch_session = None
+        page.evaluate_handle.return_value.evaluate.return_value = {"x": 100, "y": 200, "at_bottom": True, "step": 0, "touch_height": 800}
         page_tools.scroll_results(page)
         page.mouse.wheel.assert_not_called()
         page_tools.scroll_results(page, retry_bottom=True)
         page.mouse.move.assert_called_once_with(100, 200)
         page.mouse.wheel.assert_called_once_with(0, -120)
+
+    def test_no_motion_uses_container_only_when_pacing_allows(self):
+        page = Mock()
+        handle = page.evaluate_handle.return_value
+        metrics = dict(step=250, top=0, viewport=430, at_bottom=False)
+        previous = dict(metrics, strategy="gesture", unmoved=1)
+        handle.evaluate.side_effect = [dict(metrics), dict(metrics), 250]
+        self.assertEqual(page_tools.scroll_results(page, previous=previous, can_scroll=lambda: False)["strategy"], "idle")
+        result = page_tools.scroll_results(page, previous=previous, can_scroll=lambda: True)
+        self.assertEqual((result["strategy"], result["after_top"]), ("container", 250))
+        self.assertEqual(handle.dispose.call_count, 2)
 
     def test_response_summary_has_counts_without_raw_payload(self):
         data = {"data": {"items": [{"secret": "do-not-store"}], "has_more": True, "is_repeated": False},

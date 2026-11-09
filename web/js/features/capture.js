@@ -19,7 +19,9 @@ function createCaptureFeature({ state, capturePanel }) {
     const needsVerification = state.job.browser_available && state.job.status === "verification" && state.job.intervention_kind === "verification";
     open.hidden = !needsVerification;
     open.disabled = state.job.status === "stopping";
-    open.textContent = state.job.status === "verification" && state.job.intervention_kind !== "loading" ? "前往验证" : "查看抓取页面";
+    open.textContent = "人机验证";
+    open.setAttribute("aria-haspopup", "dialog");
+    open.setAttribute("aria-controls", "capture-dialog");
     const paused = state.job.status === "paused";
     const cooling = paused && state.job.intervention_kind !== "rate_limit_ready";
     resume.hidden = !needsVerification && !paused;

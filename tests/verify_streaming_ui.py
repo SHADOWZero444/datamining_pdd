@@ -148,10 +148,10 @@ def main():
                 page.set_viewport_size({"width": 1280, "height": 850})
                 page.evaluate("document.querySelector('#stage').scrollTop=0")
                 jobs.job.update(status="verification", intervention_kind="verification",
-                               message="请点击“前往验证”，在抓取窗口完成验证；完成后会自动继续")
-                page.get_by_role("button", name="前往验证", exact=True).wait_for()
+                               message="请点击“人机验证”，在抓取窗口完成验证；完成后会自动继续")
+                page.get_by_role("button", name="人机验证", exact=True).wait_for()
                 with page.expect_response(lambda response: response.url.endswith("/api/search/browser")) as opened:
-                    page.get_by_role("button", name="前往验证", exact=True).click()
+                    page.get_by_role("button", name="人机验证", exact=True).click()
                 assert opened.value.status == 200
                 assert jobs.job_capture_view.opened.is_set()
                 page.locator('#capture-dialog').wait_for(state='visible')
@@ -178,7 +178,8 @@ def main():
                     page.locator('#capture-continue').click()
                 assert resumed.value.status == 200
                 assert jobs.job_resume_request.is_set()
-                assert not jobs.job_capture_view.opened.is_set()
+                assert jobs.job_capture_view.opened.is_set()
+                jobs.job_capture_view.close()  # 后台确认后才关闭。
                 remote.close()
                 page.locator('#capture-dialog').wait_for(state='hidden')
                 jobs.job.update(status='running', intervention_kind=None)

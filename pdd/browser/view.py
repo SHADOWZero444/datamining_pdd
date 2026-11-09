@@ -4,6 +4,7 @@ import math
 import queue
 import threading
 import time
+from .mobile import manual_pointer
 
 
 class CaptureView:
@@ -33,6 +34,10 @@ class CaptureView:
     def snapshot(self):
         with self._lock:
             return {**self._snapshot, "opened": self.opened.is_set()}
+
+    def unavailable(self, reason):
+        with self._lock:
+            self._snapshot = {"image": None, "error": reason}
 
     def submit(self, payload):
         """仅接受用户指针、文字及导航按键，不接收脚本、URL 或 CDP 命令。"""
@@ -93,20 +98,8 @@ class CaptureView:
             if command:
                 action = command["action"]
                 if action == "pointer":
-                    size = page.viewport_size or page.evaluate("({width:innerWidth,height:innerHeight})")
-                    points = command["points"]
-                    def move(point):
-                        page.mouse.move(point[0] * (size["width"] - 1), point[1] * (size["height"] - 1))
-                    move(points[0])
-                    page.mouse.down()
-                    try:
-                        for point in points[1:]:
-                            if not self.opened.is_set() or (should_stop and should_stop()):
-                                break
-                            page.wait_for_timeout(min(point[2], 30))
-                            move(point)
-                    finally:
-                        page.mouse.up()
+                    manual_pointer(page, command["points"], lambda: self.opened.is_set()
+                                   and generation == self._generation and not (should_stop and should_stop()))
                 elif action == "key":
                     page.keyboard.press(command["key"])
                 elif action == "text":

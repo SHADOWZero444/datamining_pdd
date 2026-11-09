@@ -29,7 +29,7 @@ def run_search(keyword, limit=None, filters=None, cancel_event=None, progress=No
                              cancel_event.is_set if cancel_event else None) as page:
             if on_browser_ready:
                 on_browser_ready(True)
-            diagnostics["browser_mode"] = "android-touch-v5"
+            diagnostics["browser_mode"] = "android-touch-v6"
             def record_environment():
                 try:
                     diagnostics["browser_environment"] = page.evaluate("""() => ({

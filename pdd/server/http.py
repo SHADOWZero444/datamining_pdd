@@ -127,7 +127,6 @@ class AppHandler(LocalHandler):
                     jobs.job_capture_view.close()
                 elif action == "resume" and jobs.job_resume_request is not None and jobs.job["status"] == "verification":
                     jobs.job_resume_request.set()
-                    jobs.job_capture_view.close()
                 elif action in ("pointer", "wheel", "key", "text"):
                     try:
                         jobs.job_capture_view.submit(payload)
