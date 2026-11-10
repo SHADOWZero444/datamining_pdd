@@ -19,7 +19,9 @@ function createSearchFeature({ state, preferences, TAGS, badgeText, esc, money, 
 
   function viewOf(keyword) {
     if (!state.views[keyword]) {
-      state.views[keyword] = { page: 1, pageSize: preferences.pageSize, startId: "", endId: "", sort: null };
+      state.views[keyword] = { page: 1, pageSize: preferences.pageSize, startId: "", endId: "", sort: null,
+        filters: emptyResultFilters(), filterDraft: emptyResultFilters(), filtersOpen: false,
+        filterError: "", exporting: false, exportMessage: "" };
     }
     return state.views[keyword];
   }
@@ -41,9 +43,10 @@ function createSearchFeature({ state, preferences, TAGS, badgeText, esc, money, 
     const rows = [...(state.goods[keyword] || [])];
     const start = numericValue(view.startId);
     const end = numericValue(view.endId);
+    const matches = resultPredicate(view.filters);
     let visible = rows.filter((item) => {
       const seq = numericValue(item.seq);
-      return (start < 0 || seq >= start) && (end < 0 || seq <= end);
+      return (start < 0 || seq >= start) && (end < 0 || seq <= end) && matches(item);
     });
     const sort = view.sort;
     if (!sort) return visible.sort((a, b) => numericValue(a.seq) - numericValue(b.seq));
@@ -51,8 +54,9 @@ function createSearchFeature({ state, preferences, TAGS, badgeText, esc, money, 
     const factor = sort.direction === "asc" ? 1 : -1;
     return visible.sort((a, b) => {
       if (field === "updated") return factor * (Number(a.updated === true) - Number(b.updated === true));
-      const aValue = field === "title" || field === "shop_name" ? String(a[field] || "") : numericValue(a[field]);
-      const bValue = field === "title" || field === "shop_name" ? String(b[field] || "") : numericValue(b[field]);
+      const value = item => field === "shop_name" ? String(item.detail?.shop_name || "") :
+        field === "title" ? String(item.title || "") : field === "sales" ? resultSalesValue(item.sales) : numericValue(item[field]);
+      const aValue = value(a), bValue = value(b);
       if (typeof aValue === "string") return factor * aValue.localeCompare(bValue, "zh-CN");
       return factor * (aValue - bValue);
     });
@@ -137,12 +141,12 @@ function createSearchFeature({ state, preferences, TAGS, badgeText, esc, money, 
           <p class="name">${esc(item.title || "未命名商品")}</p>
           <div class="badges">${(item.badges || []).map((id) => `<span>${esc(badgeText(id))}</span>`).join("")}</div>
         </td>
-        <td class="shop">${esc(item.shop_name || "未知")}</td>
+        <td class="shop">${esc(item.detail?.shop_name || "未取得")}</td>
         <td class="price">${esc(money(item.price))}</td>
         <td class="sales">${esc(item.sales || "—")}</td>
         <td class="update-flag${item.updated === true ? " changed" : ""}">${item.updated === true ? "是" : "否"}</td>
       </tr>
-    `).join("") : `<tr><td colspan="7"><p class="empty">${running ? "正在抓取，结果会陆续出现在这里。" : rows.length ? "没有符合当前序号范围的商品。" : "还没有符合条件的商品。"}</p></td></tr>`;
+    `).join("") : `<tr><td colspan="7"><p class="empty">${rows.length && resultFilterCount(view.filters) ? "没有匹配的商品，请调整条件或清除筛选。" : running ? "正在抓取，结果会陆续出现在这里。" : rows.length ? "没有符合当前序号范围的商品。" : "还没有符合条件的商品。"}</p></td></tr>`;
     return `
       <div class="result-head">
         <div>
@@ -165,6 +169,7 @@ function createSearchFeature({ state, preferences, TAGS, badgeText, esc, money, 
         </form>
         <p class="table-count">显示 ${pageRows.length ? (view.page - 1) * view.pageSize + 1 : 0}–${Math.min(view.page * view.pageSize, visibleRows.length)} / ${visibleRows.length} 条${visibleRows.length !== rows.length ? `（共 ${rows.length} 条）` : ""}</p>
       </section>
+      ${resultFilterBar(keyword, view, TAGS, visibleRows.length)}
       <div class="catalog-scroll" role="region" aria-label="商品列表，可横向滚动" tabindex="0"><table class="catalog">
         <thead><tr>${sortHeader("seq", "ID")}<th>图片</th>${sortHeader("title", "商品")}${sortHeader("shop_name", "店名")}${sortHeader("price", "价格")}${sortHeader("sales", "销量")}${sortHeader("updated", "更新", "本轮更新中，已有商品的内容是否发生变化")}</tr></thead>
         <tbody>${body}</tbody>
@@ -176,6 +181,7 @@ function createSearchFeature({ state, preferences, TAGS, badgeText, esc, money, 
   function detailPage(tab) {
     const item = (state.goods[tab.keyword] || []).find((row) => row.goods_id === tab.goodsId);
     if (!item) return `<p class="empty">这条商品不在当前结果里。</p>`;
+    const images = [...new Set((item.detail?.images || []).map(url => safeWebUrl(url)).filter(Boolean))];
     return `
       <article class="detail">
         ${item.image ? `<img src="${esc(safeWebUrl(item.image))}" alt="${esc(item.title || "")}">` : `<span class="ph"></span>`}
@@ -184,15 +190,18 @@ function createSearchFeature({ state, preferences, TAGS, badgeText, esc, money, 
           <p class="price">${esc(money(item.price))}</p>
           <div class="badges">${(item.badges || []).map((id) => `<span>${esc(badgeText(id))}</span>`).join("")}</div>
           <dl>
-            <dt>销量</dt><dd>${esc(item.sales || "未知")}</dd>
+            <dt>销量</dt><dd>${esc(item.sales || "未取得")}</dd>
             <dt>商品编号</dt><dd>${esc(item.goods_id)}</dd>
             <dt>ID</dt><dd>${esc(item.seq || "")}</dd>
-            <dt>店名</dt><dd>${esc(item.shop_name || "未知")}</dd>
+            <dt>店名</dt><dd>${esc(item.detail?.shop_name || "未取得")}</dd>
             <dt>词条</dt><dd>${esc(tab.keyword)}</dd>
           </dl>
           <p><a href="${esc(safeWebUrl(item.url, true))}" target="_blank" rel="noreferrer">在拼多多打开</a></p>
           <p><button class="ghost" type="button" data-delete-goods="${esc(item.goods_id)}" data-keyword="${esc(tab.keyword)}" ${state.job.running && state.job.keyword === tab.keyword ? 'disabled title="请先停止抓取"' : ''}>删除这条</button></p>
         </div>
+        <section class="detail-gallery"><h2>商品图片</h2>${images.length ? images.map((url, i) =>
+          `<img src="${esc(url)}" loading="lazy" decoding="async" referrerpolicy="no-referrer" alt="商品详情图 ${i + 1}">`).join("") :
+          "<p>尚未取得详情图片。</p>"}</section>
       </article>`;
   }
 
@@ -203,7 +212,7 @@ function createSearchFeature({ state, preferences, TAGS, badgeText, esc, money, 
     const template = document.createElement("template");
     template.innerHTML = resultPage(keyword);
     const scrollTop = stage.scrollTop;
-    for (const selector of ["[data-refresh-keyword]", "[data-delete-keyword]"]) {
+    for (const selector of ["[data-refresh-keyword]", "[data-delete-keyword]", '[data-export-format="xlsx"]', '[data-export-format="csv"]']) {
       const current = stage.querySelector(selector);
       const next = template.content.querySelector(selector);
       if (current && next) {
@@ -212,7 +221,7 @@ function createSearchFeature({ state, preferences, TAGS, badgeText, esc, money, 
         if (current.textContent !== next.textContent) current.textContent = next.textContent;
       }
     }
-    for (const selector of [".conditions", ".result-status", ".table-count", ".catalog tbody"]) {
+    for (const selector of [".conditions", ".result-status", ".table-count", ".filter-summary", ".filter-error", ".export-status", ".catalog tbody"]) {
       const current = stage.querySelector(selector);
       const next = template.content.querySelector(selector);
       if (current && next && current.innerHTML !== next.innerHTML) {

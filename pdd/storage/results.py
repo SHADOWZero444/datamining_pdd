@@ -133,6 +133,11 @@ def _read_jsonl_cached(filename, modified, size):
         try:
             row = json.loads(line)
             if isinstance(row, dict):
+                # 旧详情版把 detail.sales 复制到了顶层；不要当成搜索销量展示。
+                detail = row.get("detail")
+                if isinstance(detail, dict) and "sales" in detail:
+                    if row.get("sales") == detail.pop("sales"):
+                        row.pop("sales", None)
                 rows.append(row)
         except json.JSONDecodeError:
             continue
@@ -246,7 +251,7 @@ def list_keywords():
 def product_values(row):
     fields = ("title", "shop_name", "price", "sales", "image")
     values = tuple(str(row.get(field, "") or "").strip() for field in fields)
-    return values, frozenset(row.get("badges") or [])
+    return values, frozenset(row.get("badges") or []), tuple((row.get("detail") or {}).get("images") or [])
 
 
 @synchronized
@@ -266,8 +271,14 @@ def merge_goods(keyword, new_rows, *, baseline=None, reset_updates=False):
         # 接口和页面可能在不同批次才补齐字段，缺失值不能抹掉已知数据。
         observed = row if baseline is None else {k: v for k, v in row.items() if v not in (None, "")}
         item = {**previous, **observed, "goods_id": key, "seq": previous.get("seq") or row.get("seq")}
+        if not item.get("sales") and previous.get("sales"):
+            item["sales"] = previous["sales"]
         if not item.get("shop_name"):
             item["shop_name"] = previous.get("shop_name") or ""
+        if previous.get("detail") or row.get("detail"):
+            detail = {**(previous.get("detail") or {}),
+                      **{k: v for k, v in (row.get("detail") or {}).items() if v}}
+            item.update(detail=detail, shop_name=detail.get("shop_name", ""))
         if baseline is not None:
             item["updated"] = key in baseline and product_values(item) != baseline[key]
         merged[key] = item

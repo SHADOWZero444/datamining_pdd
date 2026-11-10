@@ -3,7 +3,7 @@ import math
 import time
 from pdd.browser.verification import VerificationTarget, handle_verification
 from .target import CollectionTarget
-from .pacing import PagePacer
+from .pacing import PagePacer, remember_cooldown
 from .pause import wait_for_manual_resume
 from .responses import error_code, failure_kind, verification_hint
 from .parsing import read_live_goods, read_dom_goods, goods_from_api
@@ -18,10 +18,10 @@ MAX_AUTO_WAIT = 300
 
 def collect(page, limit=None, should_stop=None, progress=None, filters=None,
             on_batch=None, diagnostics=None, on_intervention=None, browser_request=None,
-            resume_request=None, capture_view=None, keyword="", target=None):
+            resume_request=None, capture_view=None, keyword="", target=None, pacer=None, detail_step=None):
     """返回当前可访问的结果；只有明确的结束信号才称为完成。"""
     target = target if target is not None else CollectionTarget(limit, filters=filters)
-    pacer = PagePacer()
+    pacer = pacer if pacer is not None else PagePacer()
     stats = diagnostics if diagnostics is not None else {}
     stats.update(scanned=0, matched=0, api_requests=0, api_responses=0, unreadable_responses=0,
                  rate_limits=0, http_errors={}, stop_reason="running", message="",
@@ -125,6 +125,7 @@ def collect(page, limit=None, should_stop=None, progress=None, filters=None,
         exponent = min(stats["consecutive_rate_limits"] - 1, 4)
         fallback = min(RATE_LIMIT_MAX_FALLBACK, RATE_LIMIT_INITIAL_WAIT * 2 ** exponent)
         delay = retry_delay(retry_after, fallback)
+        remember_cooldown(delay)
         cooldown_until = max(cooldown_until, time.monotonic() + delay)
         pacer.slow_down()
         stats["page_interval_seconds"] = round(pacer.interval, 2)
@@ -214,6 +215,9 @@ def collect(page, limit=None, should_stop=None, progress=None, filters=None,
             # DOM 中缺失的字段不覆盖接口已提供的标签等信息。
             previous = seen.get(key, {})
             row = {**previous, **{k: v for k, v in row.items() if v not in (None, "", [])}}
+            detail = accepted.get(key, {}).get("detail")
+            if detail:
+                row.update(detail=detail, shop_name=detail.get("shop_name", ""))
             seen[key] = row
             if not target.accept(row):
                 continue
@@ -359,7 +363,7 @@ def collect(page, limit=None, should_stop=None, progress=None, filters=None,
             flush()
             if time.monotonic() >= cooldown_until:
                 report()
-            if target.reached:
+            if target.reached and not detail_step:
                 finish("limit", f"本轮已核对 {target.limit} 条" if target.refresh else f"已达到累计目标 {target.limit} 条")
                 break
             phase = "page_state"
@@ -409,6 +413,23 @@ def collect(page, limit=None, should_stop=None, progress=None, filters=None,
                 # 短轮询让新到达的 429 能延长等待，且每轮重新检查取消、验证和用户接管。
                 wait_with_cancel(page, min(1000, remaining * 1000), should_stop)
                 continue
+            if detail_step and not stats["consecutive_rate_limits"]:
+                def safe():
+                    return not (blocked or pending_requests or challenge_response or login_response
+                                or (capture_view and capture_view.opened.is_set()))
+                closing = target.reached or exhausted or state == "end"
+                if closing and pending_requests and time.monotonic() - last_new < STALL_SECONDS:
+                    wait_with_cancel(page, 200, should_stop)
+                    continue
+                if safe() and detail_step(accepted, safe, closing):
+                    last_new = time.monotonic()
+                    if stats.get("detail_stop_reason"):
+                        finish("detail_interrupted", "详情读取中断，已保留列表和已取得的详情")
+                        break
+                    continue
+            if target.reached:
+                finish("limit", f"已达到累计目标 {target.limit} 条")
+                break
             if exhausted or state == "end":
                 finish("end", "当前搜索页已没有更多结果")
                 break
@@ -476,4 +497,5 @@ def collect(page, limit=None, should_stop=None, progress=None, filters=None,
         page.remove_listener("requestfailed", request_finished)
         flush()
         stats["api_total"] = total
+        stats["detail_access_blocked"] = bool(blocked or challenge_response or login_response or stats["consecutive_rate_limits"])
     return list(accepted.values()), total

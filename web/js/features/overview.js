@@ -29,7 +29,7 @@ function toolsOverview() {
   return `<section class="tools-overview" aria-labelledby="tools-overview-title">
     <header class="tools-overview-heading">
       <h1 class="page-title" id="tools-overview-title">功能区概览</h1>
-      <p class="lede">选择一个功能，开始整理你的商品数据。</p>
+      <p class="lede"></p>
     </header>
     <div class="feature-grid">${FEATURE_CARDS.map((card) => {
       const available = card.enabled && typeof FEATURE_ACTIONS[card.action] === "function";

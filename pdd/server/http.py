@@ -7,6 +7,7 @@ from pdd.browser.view import CaptureView
 from pdd.storage import results, library
 from pdd.services import auth as auth_service, jobs
 from pdd.scraping.filters import read_filters
+from pdd.services.export import export_results
 
 class AppHandler(LocalHandler):
     def handle_get(self):
@@ -71,6 +72,11 @@ class AppHandler(LocalHandler):
     def handle_post(self):
         path = urlparse(self.path).path
         if path == "/api/search/browser" and not self.capture_request_allowed():
+            return
+        if path == "/api/results/export":
+            payload = self.read_payload(max_bytes=16 * 1024 * 1024)
+            if payload is not None:
+                self.send_json(export_results(payload))
             return
         payload = self.read_payload()
         if payload is None:

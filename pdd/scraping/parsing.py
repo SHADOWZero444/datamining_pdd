@@ -63,7 +63,6 @@ def read_live_goods(page, keyword=""):
                 sales: item.salesTip || "",
                 image: item.imgUrl || "",
                 mall_id: item.mallEntrance && item.mallEntrance.mall_id ? String(item.mallEntrance.mall_id) : "",
-                shop_name: item.mallName || item.mall_name || (item.mallEntrance && (item.mallEntrance.mallName || item.mallEntrance.mall_name)) || "",
                 tags: (item.tagList || []).map((tag) => tag.text).filter(Boolean),
                 icons: (item.prefixIcons || []).map((icon) => icon && icon.url).filter(Boolean),
                 url: item.linkURL || "",
@@ -102,7 +101,6 @@ def read_dom_goods(page, keyword=""):
                             image: data.imgUrl || data.thumb_url || data.hd_thumb_url || "",
                             link: data.linkURL || data.link_url || "",
                             mall_id: String((data.mallEntrance && data.mallEntrance.mall_id) || data.mall_id || ""),
-                            shop_name: (data.mallName || data.mall_name || (data.mallEntrance && (data.mallEntrance.mallName || data.mallEntrance.mall_name || data.mallEntrance.name)) || "").replace(/[\uE000-\uF8FF]/g, "").trim(),
                             icons: (data.prefixIcons || []).map((icon) => icon && icon.url).filter(Boolean),
                         };
                     }
@@ -117,10 +115,6 @@ def read_dom_goods(page, keyword=""):
             cards.forEach((card) => {
                 const row = readCard(card);
                 if (row && row.goods_id && !seen.has(row.goods_id)) {
-                    if (!row.shop_name) {
-                        const lines = (card.innerText || "").split("\\n").map((line) => line.replace(/[\uE000-\uF8FF]/g, "").trim()).filter(Boolean);
-                        row.shop_name = lines.find((line) => line !== row.title && !line.includes("¥") && !line.includes("已拼") && !line.includes("已抢") && line.length <= 20) || "";
-                    }
                     seen.add(row.goods_id);
                     rows.push(row);
                 }
@@ -135,7 +129,6 @@ def read_dom_goods(page, keyword=""):
         row.pop("link", None)
         row["keyword"] = keyword
         row["tags"] = []
-        row["shop_name"] = (row.get("shop_name") or "").strip()
         row["badges"] = badges_from_urls(row.pop("icons", []) or [])
         goods.append(row)
     return goods
@@ -155,7 +148,6 @@ def normalize_model(model, keyword=""):
         "sales": model.get("sales_tip") or "",
         "image": model.get("thumb_url") or model.get("hd_thumb_url") or "",
         "mall_id": str(model.get("mall_id") or ""),
-        "shop_name": model.get("mall_name") or model.get("mallName") or "",
         "tags": tags,
         "badges": badges_from_urls(urls_in_model(model)),
         "url": urljoin(BASE, link) if link else f"{BASE}goods.html?goods_id={goods_id}",

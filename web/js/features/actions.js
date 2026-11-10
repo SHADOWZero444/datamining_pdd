@@ -1,5 +1,54 @@
-function createActionHandler({ state, api, render, renderStage, renderNav, renderCaptureBar, capturePanel, loadGoods, openTab, closeTab, viewOf, updateResultPage, openOverviewFeature, askModal, openEntryMenu, openGroupMenu, moveKeywords, removeKeywords }) {
+function createActionHandler({ state, api, render, renderStage, renderNav, renderCaptureBar, capturePanel, loadGoods, openTab, closeTab, viewOf, updateResultPage, sortedAndRangedRows, openOverviewFeature, askModal, openEntryMenu, openGroupMenu, moveKeywords, removeKeywords }) {
   async function handleClick(event) {
+    const toggle = event.target.closest("[data-toggle-filters]");
+    if (toggle) {
+      const view = viewOf(toggle.dataset.toggleFilters);
+      view.filtersOpen = !view.filtersOpen;
+      toggle.setAttribute("aria-expanded", String(view.filtersOpen));
+      $("result-filter-fields").hidden = !view.filtersOpen;
+      return;
+    }
+    const reset = event.target.closest("[data-reset-filters]");
+    if (reset) {
+      const term = reset.dataset.resetFilters;
+      const form = $("result-filter-fields");
+      for (const input of form.querySelectorAll("input")) {
+        if (input.type === "checkbox") input.checked = false;
+        else input.value = "";
+      }
+      const view = viewOf(term);
+      readResultFilters(form, view);
+      if (!view.exporting) view.exportMessage = "";
+      updateResultPage(term);
+      return;
+    }
+    const exportButton = event.target.closest("[data-export-format]");
+    if (exportButton) {
+      const term = exportButton.dataset.exportTerm;
+      const view = viewOf(term);
+      if (view.exporting || view.filterError) return;
+      const ids = sortedAndRangedRows(term).map(row => row.goods_id);
+      if (!ids.length) return;
+      const refreshVisible = () => {
+        if (state.section === "tools" && state.active === `result:${term}`) updateResultPage(term);
+      };
+      view.exporting = true;
+      view.exportMessage = `请选择保存位置，共 ${ids.length} 条。`;
+      refreshVisible();
+      try {
+        const result = await api("/api/results/export", {
+          method: "POST", headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({keyword: term, format: exportButton.dataset.exportFormat, ids, revision: state.revisions[term]}),
+        });
+        view.exportMessage = result.cancelled ? "已取消导出。" : `已将 ${result.count} 条商品保存到 ${result.path}`;
+      } catch (error) {
+        view.exportMessage = error.message;
+      } finally {
+        view.exporting = false;
+        refreshVisible();
+      }
+      return;
+    }
     const browserAction = event.target.closest("[data-capture-browser]");
     if (browserAction) {
       browserAction.disabled = true;

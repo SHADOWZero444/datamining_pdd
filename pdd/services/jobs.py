@@ -118,6 +118,8 @@ def run_job(keyword, limit, filters, cancel_event, refresh=False):
             if saved:
                 status = "partial"
             message += f"。累计符合条件 {diagnostics.get('cumulative_matched', 0)}/{limit} 条，目标尚未完成"
+        if diagnostics.get("detail_total"):
+            message += f"。本轮详情完整读取 {diagnostics.get('detail_complete', 0)}/{diagnostics['detail_total']} 条"
         with job_lock:
             job.update({
                 "status": status,

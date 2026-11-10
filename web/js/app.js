@@ -61,10 +61,19 @@ const { applyListTools, viewOf, describeConditions, sortedAndRangedRows, searchF
 const { renderCaptureBar } = createCaptureFeature({ state, capturePanel });
 const { topPage } = createPagesFeature({ state, TOP, EYE_ICON, esc, settingsPage });
 const handleClick = createActionHandler({ state, api, render, renderStage, renderNav, renderCaptureBar, capturePanel,
-  loadGoods, openTab, closeTab, viewOf, updateResultPage, openOverviewFeature, askModal, openEntryMenu, openGroupMenu, moveKeywords, removeKeywords });
+  loadGoods, openTab, closeTab, viewOf, updateResultPage, sortedAndRangedRows, openOverviewFeature, askModal, openEntryMenu, openGroupMenu, moveKeywords, removeKeywords });
 const handleSubmit = createFormHandler({ state, api, render, applyListTools, viewOf, sortedAndRangedRows, renderStage, loadGoods, openTab });
 document.body.addEventListener("click", (event) => handleClick(event).catch(showActionError));
 document.body.addEventListener("submit", (event) => handleSubmit(event).catch(showActionError));
+document.body.addEventListener("input", event => {
+  const form = event.target.closest("[data-result-filters]");
+  if (!form || event.isComposing) return;
+  const term = form.dataset.resultFilters;
+  const view = viewOf(term);
+  readResultFilters(form, view);
+  if (!view.exporting) view.exportMessage = "";
+  updateResultPage(term);
+});
 bindClipboard();
 
 function showActionError(error) {
@@ -156,6 +165,8 @@ async function refresh() {
   if (wasWaitingForLogin && !state.auth.running && state.auth.status === "ok") await loadCookie();
   const tab = state.tabs.find((item) => item.id === state.active);
   let goodsChanged = false;
+  const openItem = () => tab?.kind === "goods" && state.goods[tab.keyword]?.find(row => row.goods_id === tab.goodsId);
+  const previousItem = openItem();
   if (tab && (tab.kind === "search" || tab.kind === "goods")) {
     goodsChanged = await loadGoods(tab.keyword);
   }
@@ -165,7 +176,8 @@ async function refresh() {
   if (tab?.kind === "search" && state.section === "tools" &&
       (jobChanged || goodsChanged || authChanged || $("stage").querySelector(".catalog tbody[data-deferred]"))) {
     updateResultPage(tab.keyword);
-  } else if (tab?.kind === "goods" && state.section === "tools" && (goodsChanged || jobChanged)) {
+  } else if (tab?.kind === "goods" && state.section === "tools" &&
+      ((goodsChanged && previousItem !== openItem()) || priorJob.running !== state.job.running || priorJob.keyword !== state.job.keyword)) {
     if (!$("stage").contains(document.activeElement) && !window.getSelection()?.toString()) renderStage();
   } else if (state.section === "home" && authChanged && !$("cookie-form")?.contains(document.activeElement)) {
     renderStage();

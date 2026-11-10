@@ -29,6 +29,7 @@ RUNTIME_ASSETS = (
     'web/js/features/navigation.js',
     'web/js/features/overview.js',
     'web/js/features/pages.js',
+    'web/js/features/result-filters.js',
     'web/js/features/search.js',
     'web/js/features/settings.js',
 )

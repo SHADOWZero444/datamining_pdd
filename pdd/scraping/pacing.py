@@ -1,6 +1,19 @@
 """串行翻页节奏：按请求起点计时，网络响应和渲染期间不发起滚动。"""
 import time
+import math
 from collections import deque
+
+# 桌面端一次只运行一个任务。同进程切词或重新开始也不能提前结束服务器冷却。
+_site_deadline = 0.0
+
+
+def remember_cooldown(seconds):
+    global _site_deadline
+    _site_deadline = max(_site_deadline, time.monotonic() + seconds)
+
+
+def remaining_cooldown():
+    return max(0, math.ceil(_site_deadline - time.monotonic()))
 
 
 class PagePacer:

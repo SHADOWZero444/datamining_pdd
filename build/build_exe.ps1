@@ -1,5 +1,5 @@
 Set-Location -LiteralPath (Split-Path -Parent $PSScriptRoot)
-python -m pip install pyinstaller pywebview
+python -m pip install pyinstaller pywebview XlsxWriter==3.2.5
 $icon = "icons\app.ico"
 $args = @(
     "-m", "PyInstaller",

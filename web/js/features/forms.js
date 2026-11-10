@@ -12,6 +12,10 @@ function createFormHandler({ state, api, render, applyListTools, viewOf, sortedA
       render();
       return;
     }
+    if (event.target.matches("[data-result-filters]")) {
+      event.preventDefault();
+      return;
+    }
     const listTools = event.target.closest("[data-list-tools]");
     if (listTools) {
       event.preventDefault();

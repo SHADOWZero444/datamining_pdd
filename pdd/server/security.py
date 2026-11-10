@@ -55,7 +55,7 @@ class LocalHandler(SimpleHTTPRequestHandler):
         if self.request_allowed():
             super().do_HEAD()
 
-    def read_payload(self):
+    def read_payload(self, max_bytes=65536):
         if self.headers.get_content_type() != "application/json":
             self.send_json({"ok": False, "message": "请求必须使用 JSON 格式。"}, 415)
             return None
@@ -63,7 +63,7 @@ class LocalHandler(SimpleHTTPRequestHandler):
         if not raw.isascii() or not raw.isdigit() or self.headers.get("Transfer-Encoding"):
             raise ValueError("请求长度无效。")
         length = int(raw)
-        if length > 65536:
+        if length > max_bytes:
             self.send_json({"ok": False, "message": "请求内容过长。"}, 413)
             return None
         try:
